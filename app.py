@@ -69,29 +69,49 @@ def fuzzy_match_tokens(csv_tokens: list[str], ocr_text: str, threshold: float = 
     return False
 
 
+def extract_time_from_datetime(datetime_val) -> str:
+    """Extracts just the time string (e.g. '10:00 AM') from a full datetime string."""
+    if pd.isna(datetime_val):
+        return "N/A"
+    
+    val_str = str(datetime_val).strip()
+    try:
+        dt = pd.to_datetime(val_str)
+        return dt.strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        # Fallback regex extraction for time pattern
+        match = re.search(r"\d{1,2}:\d{2}(?:\s*[AP]M)?", val_str, re.IGNORECASE)
+        return match.group(0) if match else val_str
+
+
 def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Page-first audit engine ensuring each PDF sheet matches its corresponding CSV entry."""
+    """Page-first audit engine with refined employee, break, and timestamp filtering."""
     
     emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
     mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower()), df.columns[1])
     change_col = "Change" if "Change" in df.columns else next((c for c in df.columns if "change" in c.lower()), None)
     in_date_col = "In Date" if "In Date" in df.columns else next((c for c in df.columns if "date" in c.lower()), None)
+    out_date_col = "Out Date" if "Out Date" in df.columns else None
+    job_title_col = "Job Title" if "Job Title" in df.columns else None
     time_edit_col = "Time" if "Time" in df.columns else None
 
-    filtered = df.copy()
-    
-    # Filter out CREATE entries (keep manager modifications/deletions)
+    # 1. Ignore rows where Manager is blank/NaN
+    filtered = df.dropna(subset=[mgr_col]).copy()
+
+    # 2. Filter out CREATE entries
     if change_col and change_col in filtered.columns:
         filtered = filtered[filtered[change_col] != "CREATE"]
 
-    # Exclude system / ghost entries
+    # 3. Ignore ghost employees (names containing digits or standard system words)
+    has_digit_pattern = r"\d"
     system_terms = ["system", "ghost", "house", "auto", "toast", "drawer"]
-    pattern = "|".join(system_terms)
+    system_pattern = "|".join(system_terms)
     
     filtered = filtered[
-        ~filtered[emp_col].astype(str).str.lower().str.contains(pattern, na=False) &
-        ~filtered[mgr_col].astype(str).str.lower().str.contains(pattern, na=False)
-    ].dropna(subset=[mgr_col]).copy()
+        ~filtered[emp_col].astype(str).str.contains(has_digit_pattern, regex=True, na=False) &
+        ~filtered[emp_col].astype(str).str.lower().str.contains(system_pattern, na=False) &
+        ~filtered[mgr_col].astype(str).str.lower().str.contains(system_pattern, na=False)
+    ].copy()
 
     # Flag column for form match
     filtered["Has_Signed_Form"] = False
@@ -99,7 +119,6 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
 
     # PROCESS PDF PAGES FIRST
     for page_idx, page_text in enumerate(ocr_pages):
-        # Ignore pages that are paycheck rosters or cover sheets lacking request text
         if "EDITED PUNCH REQUEST" not in page_text.upper() and "SOLICITUD" not in page_text.upper():
             continue
 
@@ -139,13 +158,29 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
             filtered.loc[best_match_idx, "Has_Signed_Form"] = True
             used_csv_indices.add(best_match_idx)
 
-    # Build summary and details DataFrames
+    # Build detailed records
     details_list = []
     for _, row in filtered.iterrows():
+        job_title = str(row[job_title_col]) if job_title_col and not pd.isna(row[job_title_col]) else ""
+        is_break = "Yes" if "break" in job_title.lower() else "No"
+
+        in_time = extract_time_from_datetime(row[in_date_col]) if in_date_col else "N/A"
+        out_time = extract_time_from_datetime(row[out_date_col]) if out_date_col else "N/A"
+
+        shift_date = "N/A"
+        if in_date_col and not pd.isna(row[in_date_col]):
+            try:
+                shift_date = pd.to_datetime(row[in_date_col]).strftime("%m/%d/%Y")
+            except Exception:
+                shift_date = str(row[in_date_col]).split()[0]
+
         details_list.append({
             "Manager": str(row[mgr_col]).strip(),
             "Employee": str(row[emp_col]).strip(),
-            "Edit_Date": str(row[in_date_col]) if in_date_col else "N/A",
+            "Shift_Date": shift_date,
+            "In_Time": in_time,
+            "Out_Time": out_time,
+            "Is_Break_Edit": is_break,
             "Has_Signed_Form": row["Has_Signed_Form"]
         })
 
@@ -186,18 +221,23 @@ def create_word_docx(summary_df: pd.DataFrame, details_df: pd.DataFrame) -> io.B
             str(row["Forms_Missing"]), f"{row['Compliance_Pct']}%"
         )
 
-    doc.add_heading("Missing Forms Detail", level=2)
-    missing = details_df[~details_df["Has_Signed_Form"]]
-    if missing.empty:
-        doc.add_paragraph("All manager edits have corresponding signed forms present.")
-    else:
-        m_table = doc.add_table(rows=1, cols=3)
-        m_table.style = "Table Grid"
-        m_hdr = m_table.rows[0].cells
-        m_hdr[0].text, m_hdr[1].text, m_hdr[2].text = "Manager", "Employee", "Edit Date"
-        for _, row in missing.iterrows():
-            r = m_table.add_row().cells
-            r[0].text, r[1].text, r[2].text = str(row["Manager"]), str(row["Employee"]), str(row["Edit_Date"])
+    doc.add_heading("Time Edit Audit Details", level=2)
+    d_table = doc.add_table(rows=1, cols=7)
+    d_table.style = "Table Grid"
+    d_hdr = d_table.rows[0].cells
+    d_hdr[0].text, d_hdr[1].text, d_hdr[2].text, d_hdr[3].text, d_hdr[4].text, d_hdr[5].text, d_hdr[6].text = (
+        "Manager", "Employee", "Shift Date", "In Time", "Out Time", "Break Edit?", "Form Signed?"
+    )
+
+    for _, row in details_df.iterrows():
+        r = d_table.add_row().cells
+        r[0].text = str(row["Manager"])
+        r[1].text = str(row["Employee"])
+        r[2].text = str(row["Shift_Date"])
+        r[3].text = str(row["In_Time"])
+        r[4].text = str(row["Out_Time"])
+        r[5].text = str(row["Is_Break_Edit"])
+        r[6].text = "Yes" if row["Has_Signed_Form"] else "No"
 
     buffer = io.BytesIO()
     doc.save(buffer)
@@ -246,13 +286,12 @@ if st.button("Process & Generate Audit", type="primary"):
             st.subheader("Manager Summary")
             st.dataframe(summary_df, use_container_width=True)
 
-            st.subheader("Missing Forms Detail")
-            missing_df = details_df[~details_df["Has_Signed_Form"]]
-            st.dataframe(missing_df, use_container_width=True)
+            st.subheader("Audit Detail Report")
+            st.dataframe(details_df, use_container_width=True)
 
             docx_buf = create_word_docx(summary_df, details_df)
             st.download_button(
-                label="📥 Download Audit Report (.docx)",
+                label="📥 Download Full Audit Report (.docx)",
                 data=docx_buf,
                 file_name="Time_Edit_Audit_Report.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
