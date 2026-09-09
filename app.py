@@ -8,7 +8,7 @@ import pytesseract
 
 
 def extract_text_with_ocr(pdf_bytes: bytes) -> list[str]:
-    """Converts scanned PDF pages into images and runs OCR to extract text from forms."""
+    """Converts scanned PDF pages into images and runs OCR to extract text page-by-page."""
     if not pdf_bytes:
         return []
     images = convert_from_bytes(pdf_bytes)
@@ -59,9 +59,8 @@ def get_name_tokens(name_str: str) -> list[str]:
 
 
 def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Matches CSV edits against scanned PDF pages using robust token search."""
+    """Matches CSV edits against scanned PDF pages ensuring 1 PDF sheet matches max 1 shift edit."""
     
-    # Exact column selection
     emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
     mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower()), df.columns[1])
     change_col = "Change" if "Change" in df.columns else next((c for c in df.columns if "change" in c.lower()), None)
@@ -70,7 +69,7 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
 
     filtered = df.copy()
     
-    # Filter out CREATE entries (only evaluate modifications/deletions)
+    # Filter out CREATE entries
     if change_col and change_col in filtered.columns:
         filtered = filtered[filtered[change_col] != "CREATE"]
 
@@ -84,6 +83,7 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
     ].dropna(subset=[mgr_col])
 
     details = []
+    matched_pages = set()  # Track PDF page indices that have already been matched
 
     for _, row in filtered.iterrows():
         manager = str(row[mgr_col]).strip()
@@ -97,8 +97,11 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
 
         matched = False
         
-        # Pass 1: Strict match (Name AND Date on same page)
-        for page_text in ocr_pages:
+        # Pass 1: Strict match (Employee Name AND Date on same unused PDF page)
+        for page_idx, page_text in enumerate(ocr_pages):
+            if page_idx in matched_pages:
+                continue
+
             token_matches = [
                 t for t in tokens 
                 if re.search(r"\b" + re.escape(t[:4]) + r"[a-z]*\b", page_text, re.IGNORECASE)
@@ -108,17 +111,22 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
 
             if has_name and has_date:
                 matched = True
+                matched_pages.add(page_idx)
                 break
 
-        # Pass 2: Name-only fallback match if page is present
+        # Pass 2: Name-only fallback on unused PDF pages
         if not matched:
-            for page_text in ocr_pages:
+            for page_idx, page_text in enumerate(ocr_pages):
+                if page_idx in matched_pages:
+                    continue
+
                 token_matches = [
                     t for t in tokens 
                     if re.search(r"\b" + re.escape(t[:4]) + r"[a-z]*\b", page_text, re.IGNORECASE)
                 ]
                 if len(token_matches) >= 1:
                     matched = True
+                    matched_pages.add(page_idx)
                     break
 
         details.append({
@@ -204,7 +212,6 @@ if st.button("Process & Generate Audit", type="primary"):
         with st.spinner("Processing OCR on scanned PDFs and running audit..."):
             all_ocr_pages = []
             for pdf_file in pdf_files:
-                # Use .getvalue() to prevent empty buffer reads in Streamlit
                 pdf_bytes = pdf_file.getvalue()
                 pages = extract_text_with_ocr(pdf_bytes)
                 all_ocr_pages.extend(pages)
