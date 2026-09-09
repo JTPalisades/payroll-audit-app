@@ -8,16 +8,18 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml import parse_xml, OxmlElement
 from docx.oxml.ns import nsdecls, qn
 import io
+import re
 
 st.set_page_config(page_title="Payroll Audit Generator", layout="centered")
 
 st.title("Payroll Audit Report Generator")
-st.write("Upload your POS CSV Log and PDF Packet to generate a Word report matching the standardized executive compliance layout.")
+st.write("Upload your POS CSV Log and PDF Packet to perform a dynamic line-by-line reconciliation and build your executive compliance Word report.")
 
 uploaded_csv = st.file_uploader("Upload POS CSV Log", type=["csv"])
 uploaded_pdf = st.file_uploader("Upload Signed PDF Packet", type=["pdf"])
 
 def extract_pdf_text(pdf_file):
+    """Extracts all text from the uploaded PDF packet."""
     text_data = ""
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
@@ -26,7 +28,80 @@ def extract_pdf_text(pdf_file):
                 text_data += extracted + "\n"
     return text_data
 
+def process_audit_data(csv_df, pdf_text):
+    """Dynamically reconciles CSV records against PDF text."""
+    # Standardize CSV column names by trimming spaces
+    csv_df.columns = [str(c).strip() for c in csv_df.columns]
+    
+    # Identify key column names dynamically
+    col_map = {}
+    for col in csv_df.columns:
+        c_lower = col.lower()
+        if "employee" in c_lower or "name" in c_lower:
+            col_map["employee"] = col
+        elif "date" in c_lower:
+            col_map["date"] = col
+        elif "manager" in c_lower or "editor" in c_lower or "user" in c_lower:
+            col_map["manager"] = col
+        elif "action" in c_lower or "edit" in c_lower or "type" in c_lower:
+            col_map["action"] = col
+
+    # Default fallback column names if auto-detection misses
+    emp_col = col_map.get("employee", csv_df.columns[0])
+    date_col = col_map.get("date", csv_df.columns[1] if len(csv_df.columns) > 1 else csv_df.columns[0])
+    mgr_col = col_map.get("manager", csv_df.columns[3] if len(csv_df.columns) > 3 else csv_df.columns[0])
+    
+    # Check if form exists in PDF text for each employee
+    verified_flags = []
+    pdf_text_upper = pdf_text.upper()
+    
+    for _, row in csv_df.iterrows():
+        emp_name = str(row[emp_col]).strip().upper()
+        # Extract last name or significant name part for matching
+        name_parts = [p for p in emp_name.split() if len(p) > 2]
+        
+        # Match if employee name parts appear in PDF text
+        if name_parts and any(part in pdf_text_upper for part in name_parts):
+            verified_flags.append(True)
+        else:
+            verified_flags.append(False)
+
+    csv_df["_Verified"] = verified_flags
+
+    # --- Build Section 1 Data (By Date / Period) ---
+    csv_df["_Date_Group"] = csv_df[date_col].astype(str)
+    period_summary = []
+    total_edits_all = len(csv_df)
+    total_verified_all = sum(verified_flags)
+    total_missing_all = total_edits_all - total_verified_all
+
+    grouped_date = csv_df.groupby("_Date_Group")
+    for date_val, group in grouped_date:
+        tot = len(group)
+        ver = group["_Verified"].sum()
+        mis = tot - ver
+        rate = f"{(ver / tot * 100):.1f}%" if tot > 0 else "0.0%"
+        period_summary.append([f"PPE {date_val}", str(tot), str(ver), str(mis), rate])
+
+    overall_rate = f"{(total_verified_all / total_edits_all * 100):.1f}%" if total_edits_all > 0 else "0.0%"
+    period_summary.append(["COMBINED YTD TOTALS", str(total_edits_all), str(total_verified_all), str(total_missing_all), overall_rate])
+
+    # --- Build Section 2 Data (By Manager) ---
+    manager_summary = []
+    grouped_mgr = csv_df.groupby(mgr_col)
+    for mgr_val, group in grouped_mgr:
+        tot = len(group)
+        ver = group["_Verified"].sum()
+        mis = tot - ver
+        rate = f"{(ver / tot * 100):.1f}%" if tot > 0 else "0.0%"
+        manager_summary.append([str(mgr_val), str(tot), str(ver), str(mis), rate])
+
+    return period_summary, manager_summary, csv_df
+
 def build_styled_docx(csv_df, pdf_text):
+    # Dynamically compute audit metrics from uploaded files
+    rows_s1, rows_s2, processed_df = process_audit_data(csv_df, pdf_text)
+
     doc = docx.Document()
 
     # Standard Page Setup (1-inch margins)
@@ -38,7 +113,6 @@ def build_styled_docx(csv_df, pdf_text):
 
     # Styling Constants
     NAVY = "1B365D"
-    STEEL_BLUE = "5C768D"
     LIGHT_BG = "F0F4F8"
     BORDER_GREY = "D3D3D3"
 
@@ -113,7 +187,6 @@ def build_styled_docx(csv_df, pdf_text):
                 set_cell_margins(cell, top=80, bottom=80, left=120, right=120)
                 p = cell.paragraphs[0]
                 
-                # Right-align numeric columns
                 str_val = str(val).strip()
                 if c_idx > 0 and not any(char.isalpha() for char in str_val.replace("->", "").replace("PM", "").replace("AM", "")):
                     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
@@ -165,7 +238,7 @@ def build_styled_docx(csv_df, pdf_text):
     r_box_title.font.color.rgb = RGBColor(0x1B, 0x36, 0x5D)
     
     r_box_body = p_box.add_run(
-        "• Scope: Multi-Period Wage & Hour Compliance Reconciliation\n"
+        f"• Scope: Multi-Period Wage & Hour Compliance Reconciliation ({len(processed_df)} Total System Edits)\n"
         "• Prepared For: Payroll & HR Compliance\n"
         "• Verification: 100% Line-by-Line POS CSV Log vs. Physical Form Matching"
     )
@@ -173,9 +246,9 @@ def build_styled_docx(csv_df, pdf_text):
     r_box_body.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
 
     # -------------------------------------------------------------
-    # SECTION 1: EXECUTIVE SUMMARY
+    # SECTION 1: EXECUTIVE SUMMARY (DYNAMIC DATA)
     # -------------------------------------------------------------
-    add_section_header("1. Executive Summary & Audit Overview")
+    add_section_header("1. Executive Summary & Year-to-Date Audit Findings")
     
     p_exec = doc.add_paragraph(
         "A comprehensive wage and hour compliance audit was conducted across the provided pay periods. "
@@ -187,16 +260,10 @@ def build_styled_docx(csv_df, pdf_text):
     p_exec.style.font.size = Pt(10.5)
 
     headers_s1 = ["Pay Period Ending (PPE)", "Total System Edits", "Forms Verified", "Forms Missing", "Compliance Rate"]
-    rows_s1 = [
-        ["PPE 01/20/2026", "23", "12", "11", "52.2%"],
-        ["PPE 02/03/2026", "28", "16", "12", "57.1%"],
-        ["PPE 02/17/2026", "26", "14", "12", "53.8%"],
-        ["COMBINED YTD TOTALS", "77", "42", "35", "54.5%"]
-    ]
     create_and_format_table(headers_s1, rows_s1)
 
     # -------------------------------------------------------------
-    # SECTION 2: MANAGER BREAKDOWN
+    # SECTION 2: MANAGER BREAKDOWN (DYNAMIC DATA)
     # -------------------------------------------------------------
     add_section_header("2. Manager Attribution & Compliance Performance")
     
@@ -205,15 +272,10 @@ def build_styled_docx(csv_df, pdf_text):
     p_mgr.style.font.size = Pt(10.5)
 
     headers_s2 = ["Editing Manager / Editor", "Total Edits Executed", "Supported by Form", "Missing Form", "Manager Compliance %"]
-    rows_s2 = [
-        ["Bon Pinnak", "25", "18", "7", "72.0%"],
-        ["Anthony Luerra", "30", "12", "18", "40.0%"],
-        ["Donny Berger", "22", "12", "10", "54.5%"]
-    ]
     create_and_format_table(headers_s2, rows_s2)
 
     # -------------------------------------------------------------
-    # SECTION 3: DETAILED FINDINGS BY PAY PERIOD
+    # SECTION 3: DETAILED FINDINGS BY PAY PERIOD (RAW CSV ROWS)
     # -------------------------------------------------------------
     add_section_header("3. Detailed Findings by Pay Period (Itemized Data)")
 
@@ -226,11 +288,11 @@ def build_styled_docx(csv_df, pdf_text):
     r_period.font.bold = True
     r_period.font.color.rgb = RGBColor(0x5C, 0x76, 0x8D)
 
-    # Dynamically extract first 6 columns from CSV
-    cols_to_display = csv_df.columns[:6].tolist()
-    csv_rows = csv_df[cols_to_display].head(15).fillna("N/A").values.tolist()
+    # Extract display columns excluding internal processing flags
+    display_cols = [c for c in processed_df.columns if not c.startswith("_")][:6]
+    csv_rows = processed_df[display_cols].fillna("N/A").values.tolist()
 
-    create_and_format_table(cols_to_display, csv_rows)
+    create_and_format_table(display_cols, csv_rows)
 
     # -------------------------------------------------------------
     # SECTION 4: RISK ANALYSIS & ACTION PLAN
@@ -265,7 +327,7 @@ def build_styled_docx(csv_df, pdf_text):
 if uploaded_csv and uploaded_pdf:
     st.success("Files loaded successfully!")
     if st.button("Generate & Download Executive Word Report"):
-        with st.spinner("Processing files and applying executive styling..."):
+        with st.spinner("Processing files and performing dynamic audit reconciliation..."):
             csv_data = pd.read_csv(uploaded_csv)
             pdf_text = extract_pdf_text(uploaded_pdf)
             
