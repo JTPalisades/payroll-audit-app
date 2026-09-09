@@ -8,18 +8,18 @@ from pdf2image import convert_from_bytes
 import pytesseract
 
 
-def extract_text_with_ocr_split(pdf_bytes: bytes) -> list[str]:
+def extract_text_with_ocr_split(pdf_bytes: bytes) -> list[tuple[int, str]]:
     """
     Converts PDF pages to images and splits each page into TOP and BOTTOM halves.
-    Supports rotated pages and multi-form physical sheets.
+    Returns tuples of (page_index, section_text) to bind sections to physical pages.
     """
     if not pdf_bytes:
         return []
     
     images = convert_from_bytes(pdf_bytes)
-    form_sections = []
+    page_sections = []
 
-    for img in images:
+    for page_idx, img in enumerate(images):
         width, height = img.size
         
         # Crop Top and Bottom halves of page
@@ -30,11 +30,11 @@ def extract_text_with_ocr_split(pdf_bytes: bytes) -> list[str]:
         txt_bottom = pytesseract.image_to_string(bottom_half)
 
         if txt_top and len(txt_top.strip()) > 20:
-            form_sections.append(txt_top)
+            page_sections.append((page_idx, txt_top))
         if txt_bottom and len(txt_bottom.strip()) > 20:
-            form_sections.append(txt_bottom)
+            page_sections.append((page_idx, txt_bottom))
 
-    return form_sections
+    return page_sections
 
 
 def process_toast_csv(csv_files) -> tuple[pd.DataFrame, str, str, str]:
@@ -122,8 +122,8 @@ def extract_time_from_datetime(datetime_val) -> str:
         return match.group(0) if match else val_str
 
 
-def analyze_edits(df: pd.DataFrame, ocr_sections: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Shift-deduplicated audit engine ensuring 1 physical form matches exactly 1 shift edit entry."""
+def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str]]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Audit engine matching OCR sections against CSV edit entries with physical page deduplication."""
     
     emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
     mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower() or "by" in c.lower()), df.columns[1])
@@ -154,13 +154,12 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[str]) -> tuple[pd.DataFra
     # Deduplicate multiple edit rows for the same employee shift date
     filtered["Shift_Key"] = filtered[emp_col].astype(str) + "_" + pd.to_datetime(filtered[in_date_col], format="mixed", errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     
-    # Track matching status at shift level
     matched_shift_keys = set()
-    used_ocr_sections = set()
+    used_page_indices = set()
 
-    # SECTION-FIRST MATCHING
-    for sec_idx, sec_text in enumerate(ocr_sections):
-        if sec_idx in used_ocr_sections:
+    # SECTION-FIRST MATCHING WITH PHYSICAL PAGE DEDUPLICATION
+    for page_idx, sec_text in ocr_sections:
+        if page_idx in used_page_indices:
             continue
 
         best_match_key = None
@@ -199,7 +198,7 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[str]) -> tuple[pd.DataFra
 
         if best_match_key is not None:
             matched_shift_keys.add(best_match_key)
-            used_ocr_sections.add(sec_idx)
+            used_page_indices.add(page_idx)
 
     # Apply match flags back to CSV rows
     filtered["Has_Signed_Form"] = filtered["Shift_Key"].isin(matched_shift_keys)
