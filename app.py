@@ -1,8 +1,6 @@
 import streamlit as st
 import pandas as pd
 import pdfplumber
-import pytesseract
-from pdf2image import convert_from_bytes
 import docx
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -15,85 +13,68 @@ import re
 st.set_page_config(page_title="Payroll Audit Generator", layout="centered")
 
 st.title("Payroll Audit Report Generator")
-st.write("Upload your POS CSV Log and PDF Packet (digital or scanned) to perform line-by-line reconciliation.")
+st.write("Upload your POS CSV Log and PDF Packet to reconcile timecard edits against physical signed request forms.")
 
 uploaded_csv = st.file_uploader("Upload POS CSV Log", type=["csv"])
-uploaded_pdf = st.file_uploader("Upload Signed PDF Packet (Scanned or Digital)", type=["pdf"])
+uploaded_pdf = st.file_uploader("Upload Signed PDF Packet", type=["pdf"])
 
-def extract_pdf_clean_text_with_ocr(pdf_file):
-    """Extracts text using pdfplumber, falling back to OCR for scanned pages."""
+def extract_pdf_raw_text(pdf_file):
+    """Extracts raw text from PDF packet."""
     pdf_bytes = pdf_file.read()
-    pdf_file.seek(0) # Reset stream pointer
+    pdf_file.seek(0)
     
     full_text = ""
-    
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page_num, page in enumerate(pdf.pages):
+        for page in pdf.pages:
             t = page.extract_text()
-            # If standard extraction yields little/no text, run OCR on the page
-            if not t or len(t.strip()) < 10:
-                try:
-                    # Convert single PDF page to image
-                    images = convert_from_bytes(pdf_bytes, first_page=page_num+1, last_page=page_num+1)
-                    if images:
-                        ocr_text = pytesseract.image_to_string(images[0])
-                        full_text += ocr_text.upper() + "\n"
-                except Exception as e:
-                    pass
-            else:
+            if t:
                 full_text += t.upper() + "\n"
-                
     return full_text
 
-def parse_name_tokens(raw_name):
-    """Extracts search tokens (names >= 3 chars, filtering out roles)."""
-    clean_name = re.sub(r'[^A-Z\s]', '', str(raw_name).upper())
-    tokens = [w for w in clean_name.split() if len(w) >= 3 and w not in ["SERVER", "BUSSER", "HOST", "KITCHEN", "COOK", "MGR"]]
+def get_name_tokens(name_str):
+    """Cleans names and returns individual name tokens >= 3 letters."""
+    clean = re.sub(r'[^A-Z\s]', ' ', str(name_str).upper())
+    tokens = [w for w in clean.split() if len(w) >= 3 and w not in ["SERVER", "BUSSER", "HOST", "COOK", "KITCHEN", "MGR"]]
     return tokens
 
-def process_audit_reconciliation(csv_df, pdf_file):
-    csv_df.columns = [str(c).strip() for c in csv_df.columns]
-    
-    emp_col = next((c for c in csv_df.columns if "employee" in c.lower() or "name" in c.lower()), csv_df.columns[0])
-    date_col = next((c for c in csv_df.columns if "date" in c.lower() or "shift" in c.lower()), csv_df.columns[1] if len(csv_df.columns) > 1 else csv_df.columns[0])
-    mgr_col = next((c for c in csv_df.columns if "manager" in c.lower() or "editor" in c.lower() or "user" in c.lower()), csv_df.columns[3] if len(csv_df.columns) > 3 else csv_df.columns[0])
-
+def process_audit_reconciliation(csv_df, pdf_text, emp_col, date_col, mgr_col):
+    csv_df = csv_df.copy()
     csv_df['_ParsedDate'] = pd.to_datetime(csv_df[date_col], errors='coerce')
     csv_df = csv_df.dropna(subset=['_ParsedDate']).copy()
     csv_df = csv_df.sort_values('_ParsedDate')
 
-    # Run OCR / Text extraction
-    pdf_text = extract_pdf_clean_text_with_ocr(pdf_file)
-
+    pdf_text_upper = pdf_text.upper()
     verified_flags = []
     match_notes = []
 
     for _, row in csv_df.iterrows():
-        raw_name = row[emp_col]
-        name_tokens = parse_name_tokens(raw_name)
+        raw_name = str(row[emp_col])
+        tokens = get_name_tokens(raw_name)
         
         shift_dt = row['_ParsedDate']
+        
+        # Build flexible date variants
         date_variants = [
             shift_dt.strftime('%m/%d/%Y'),
             shift_dt.strftime('%m/%d/%y'),
             f"{shift_dt.month}/{shift_dt.day}/{shift_dt.year}",
             f"{shift_dt.month}/{shift_dt.day}/{shift_dt.strftime('%y')}",
-            shift_dt.strftime('%m/%d')
+            shift_dt.strftime('%m/%d'),
+            f"{shift_dt.month}/{shift_dt.day}"
         ]
 
         is_verified = False
         note = "Missing Form"
 
-        if name_tokens:
-            for token in name_tokens:
-                if token in pdf_text:
-                    for d_var in date_variants:
-                        if d_var in pdf_text:
-                            is_verified = True
-                            note = f"Matched Token: {token} & Date: {d_var}"
-                            break
-                if is_verified:
-                    break
+        # Match logic: At least ONE name token (e.g. Last Name) AND ONE Date Variant must be in PDF
+        if tokens:
+            name_matches = [t for t in tokens if t in pdf_text_upper]
+            if name_matches:
+                for d_var in date_variants:
+                    if d_var in pdf_text_upper:
+                        is_verified = True
+                        note = f"Matched: {name_matches[0]} & Date: {d_var}"
+                        break
 
         verified_flags.append(is_verified)
         match_notes.append(note)
@@ -101,18 +82,19 @@ def process_audit_reconciliation(csv_df, pdf_file):
     csv_df["_Verified"] = verified_flags
     csv_df["_MatchNote"] = match_notes
 
-    # Bi-weekly aggregation
+    # Bi-weekly Pay Period Ending Aggregation
     min_date = csv_df['_ParsedDate'].min()
-    csv_df['_PPE_Group'] = csv_df['_ParsedDate'].apply(lambda d: (min_date + pd.Timedelta(days=13 * ((d - min_date).days // 14) + 13)).strftime('%m/%d/%Y'))
+    csv_df['_PPE_Group'] = csv_df['_ParsedDate'].apply(
+        lambda d: (min_date + pd.Timedelta(days=13 * ((d - min_date).days // 14) + 13)).strftime('%m/%d/%Y')
+    )
 
-    # SECTION 1 TABLE
+    # Section 1 Table Data
     period_summary = []
     total_edits = len(csv_df)
     total_verified = int(sum(verified_flags))
     total_missing = total_edits - total_verified
 
-    grouped_period = csv_df.groupby("_PPE_Group")
-    for ppe_val, group in grouped_period:
+    for ppe_val, group in csv_df.groupby("_PPE_Group"):
         tot = len(group)
         ver = int(group["_Verified"].sum())
         mis = tot - ver
@@ -122,10 +104,9 @@ def process_audit_reconciliation(csv_df, pdf_file):
     overall_rate = f"{(total_verified / total_edits * 100):.1f}%" if total_edits > 0 else "0.0%"
     period_summary.append(["COMBINED TOTALS", str(total_edits), str(total_verified), str(total_missing), overall_rate])
 
-    # SECTION 2 TABLE
+    # Section 2 Table Data
     manager_summary = []
-    grouped_mgr = csv_df.groupby(mgr_col)
-    for mgr_val, group in grouped_mgr:
+    for mgr_val, group in csv_df.groupby(mgr_col):
         tot = len(group)
         ver = int(group["_Verified"].sum())
         mis = tot - ver
@@ -136,7 +117,7 @@ def process_audit_reconciliation(csv_df, pdf_file):
 
     return period_summary, manager_summary, csv_df
 
-def build_styled_docx(processed_df, rows_s1, rows_s2):
+def build_styled_docx(processed_df, rows_s1, rows_s2, emp_col, date_col, mgr_col):
     doc = docx.Document()
 
     for section in doc.sections:
@@ -189,14 +170,10 @@ def build_styled_docx(processed_df, rows_s1, rows_s2):
         return h
 
     def create_and_format_table(header_data, rows_data):
-        num_rows = len(rows_data) + 1
-        num_cols = len(header_data)
-        
-        table = doc.add_table(rows=num_rows, cols=num_cols)
+        table = doc.add_table(rows=len(rows_data) + 1, cols=len(header_data))
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
         set_table_borders(table)
 
-        # Header Row
         for i, header_text in enumerate(header_data):
             cell = table.cell(0, i)
             cell.text = str(header_text)
@@ -212,7 +189,6 @@ def build_styled_docx(processed_df, rows_s1, rows_s2):
                 run.font.bold = True
                 run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
 
-        # Data Rows
         for r_idx, row in enumerate(rows_data):
             for c_idx, val in enumerate(row):
                 cell = table.cell(r_idx + 1, c_idx)
@@ -237,9 +213,8 @@ def build_styled_docx(processed_df, rows_s1, rows_s2):
                         if c_idx == len(row) - 1:
                             run.font.color.rgb = RGBColor(0xA6, 0x1C, 0x1C)
 
-    # HEADER
+    # Document Header
     p_title = doc.add_paragraph()
-    p_title.paragraph_format.space_after = Pt(2)
     r_title = p_title.add_run("PUNCH EDIT AUDIT & COMPLIANCE RECONCILIATION REPORT")
     r_title.font.name = "Arial"
     r_title.font.size = Pt(18)
@@ -247,60 +222,48 @@ def build_styled_docx(processed_df, rows_s1, rows_s2):
     r_title.font.color.rgb = RGBColor(0x1B, 0x36, 0x5D)
 
     p_sub = doc.add_paragraph()
-    p_sub.paragraph_format.space_after = Pt(12)
     r_sub = p_sub.add_run("Full Multi-Period Wage & Hour Compliance Audit\nComparison of POS Audit Logs vs. Physical Signed Punch Edit Request Forms")
     r_sub.font.name = "Calibri"
     r_sub.font.size = Pt(11)
     r_sub.font.italic = True
     r_sub.font.color.rgb = RGBColor(0x5C, 0x76, 0x8D)
 
-    # Metadata Block
+    # Metadata Control Box
     box = doc.add_table(rows=1, cols=1)
     box.alignment = WD_TABLE_ALIGNMENT.CENTER
     cell = box.cell(0, 0)
     set_cell_background(cell, LIGHT_BG)
     set_cell_margins(cell, top=120, bottom=120, left=180, right=180)
     
+    total_recs = len(processed_df)
+    tot_ver = int(processed_df["_Verified"].sum())
+    tot_mis = total_recs - tot_ver
+
     p_box = cell.paragraphs[0]
-    p_box.paragraph_format.space_after = Pt(0)
     r_box_title = p_box.add_run("AUDIT METADATA & CONTROL BLOCK\n")
     r_box_title.font.bold = True
     r_box_title.font.size = Pt(10)
     r_box_title.font.color.rgb = RGBColor(0x1B, 0x36, 0x5D)
     
-    total_recs = len(processed_df)
-    tot_ver = int(processed_df["_Verified"].sum())
-    tot_mis = total_recs - tot_ver
-    
     r_box_body = p_box.add_run(
-        f"• Audit Scope: 100% Line-by-Line Reconciliation ({total_recs} Total POS System Edits)\n"
-        f"• Audit Results: {tot_ver} Verified with Form | {tot_mis} Missing Signed Form\n"
+        f"• Audit Scope: 100% Line-by-Line Reconciliation ({total_recs} Total System Edits)\n"
+        f"• Audit Findings: {tot_ver} Verified with Signed Form | {tot_mis} Missing Signed Form\n"
         f"• Governing Standards: California Labor Code §§ 226.7 & 512"
     )
     r_box_body.font.size = Pt(9.5)
-    r_box_body.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
 
-    # SECTION 1
     add_section_header("1. Executive Summary & Period Audit Findings")
-    headers_s1 = ["Pay Period Ending (PPE)", "Total System Edits", "Forms Verified", "Forms Missing", "Compliance Rate"]
-    create_and_format_table(headers_s1, rows_s1)
+    create_and_format_table(["Pay Period Ending (PPE)", "Total System Edits", "Forms Verified", "Forms Missing", "Compliance Rate"], rows_s1)
 
-    # SECTION 2
     add_section_header("2. Manager Attribution & Compliance Performance")
-    headers_s2 = ["Editing Manager / Editor", "Total Edits Executed", "Supported by Form", "Missing Form", "Manager Compliance %"]
-    create_and_format_table(headers_s2, rows_s2)
+    create_and_format_table(["Editing Manager / Editor", "Total Edits Executed", "Supported by Form", "Missing Form", "Manager Compliance %"], rows_s2)
 
-    # SECTION 3
     add_section_header("3. Detailed Findings & Itemized System Audit Log")
     raw_cols = [c for c in processed_df.columns if not c.startswith("_")][:5]
     display_df = processed_df[raw_cols].copy()
     display_df["Audit Status"] = processed_df["_Verified"].apply(lambda x: "MATCH (Signed Form Present)" if x else "DISCREPANCY (Missing Form)")
+    create_and_format_table(raw_cols + ["Audit Status"], display_df.fillna("N/A").values.tolist())
 
-    headers_s3 = raw_cols + ["Audit Status"]
-    csv_rows = display_df.fillna("N/A").values.tolist()
-    create_and_format_table(headers_s3, csv_rows)
-
-    # SECTION 4
     add_section_header("4. Risk Analysis & Corrective Action Plan")
     defect_pct = (tot_mis / total_recs * 100) if total_recs > 0 else 0.0
     risk_points = [
@@ -311,15 +274,9 @@ def build_styled_docx(processed_df, rows_s1, rows_s2):
 
     for title, desc in risk_points:
         p_risk = doc.add_paragraph()
-        p_risk.paragraph_format.space_before = Pt(4)
-        p_risk.paragraph_format.space_after = Pt(4)
         r_rtitle = p_risk.add_run(f"{title} ")
-        r_rtitle.font.name = "Calibri"
-        r_rtitle.font.size = Pt(10.5)
         r_rtitle.font.bold = True
-        r_rdesc = p_risk.add_run(desc)
-        r_rdesc.font.name = "Calibri"
-        r_rdesc.font.size = Pt(10.5)
+        p_risk.add_run(desc)
 
     buffer = io.BytesIO()
     doc.save(buffer)
@@ -328,26 +285,46 @@ def build_styled_docx(processed_df, rows_s1, rows_s2):
 
 if uploaded_csv and uploaded_pdf:
     st.success("Files uploaded successfully!")
-    
     csv_data = pd.read_csv(uploaded_csv)
     
-    with st.spinner("Running OCR text extraction and line-by-line reconciliation (this takes ~15-30s for scanned PDFs)..."):
-        rows_s1, rows_s2, processed_df = process_audit_reconciliation(csv_data, uploaded_pdf)
+    # Column Mapper UI
+    st.subheader("Select CSV Columns for Audit Matching")
+    col1, col2, col3 = st.columns(3)
     
-    total_found = int(processed_df["_Verified"].sum())
-    total_lines = len(processed_df)
-    comp_rate = (total_found / total_lines * 100) if total_lines > 0 else 0.0
+    csv_cols = list(csv_data.columns)
     
-    st.metric("Reconciliation Match Results", f"{comp_rate:.1f}% Compliance", f"{total_found} of {total_lines} Edits Verified")
+    default_emp = next((i for i, c in enumerate(csv_cols) if "employee" in c.lower() or "name" in c.lower()), 0)
+    default_date = next((i for i, c in enumerate(csv_cols) if "date" in c.lower() or "shift" in c.lower()), min(1, len(csv_cols)-1))
+    default_mgr = next((i for i, c in enumerate(csv_cols) if "manager" in c.lower() or "editor" in c.lower()), min(3, len(csv_cols)-1))
     
-    with st.expander("Preview Reconciliation Match Details (First 10 Rows)"):
-        st.dataframe(processed_df[[c for c in processed_df.columns if not c.startswith("_")][:3] + ["_Verified", "_MatchNote"]].head(10))
-
-    if st.button("Generate & Download Reconciled Word Report"):
-        docx_file = build_styled_docx(processed_df, rows_s1, rows_s2)
+    selected_emp = col1.selectbox("Employee Name Column", csv_cols, index=default_emp)
+    selected_date = col2.selectbox("Shift Date Column", csv_cols, index=default_date)
+    selected_mgr = col3.selectbox("Editing Manager Column", csv_cols, index=default_mgr)
+    
+    pdf_text = extract_pdf_raw_text(uploaded_pdf)
+    
+    # Debug expander to check if PDF text is being read properly
+    with st.expander("Debug: View Raw PDF Extracted Text"):
+        st.text_area("PDF Text Sample (First 1,000 characters)", pdf_text[:1000], height=150)
+    
+    if st.button("Run Reconciliation & Build Report"):
+        with st.spinner("Reconciling CSV against PDF forms..."):
+            rows_s1, rows_s2, processed_df = process_audit_reconciliation(
+                csv_data, pdf_text, selected_emp, selected_date, selected_mgr
+            )
+        
+        total_found = int(processed_df["_Verified"].sum())
+        total_lines = len(processed_df)
+        comp_rate = (total_found / total_lines * 100) if total_lines > 0 else 0.0
+        
+        st.metric("Reconciliation Result", f"{comp_rate:.1f}% Compliance", f"{total_found} of {total_lines} Verified")
+        
+        st.dataframe(processed_df[[selected_emp, selected_date, "_Verified", "_MatchNote"]].head(15))
+        
+        docx_file = build_styled_docx(processed_df, rows_s1, rows_s2, selected_emp, selected_date, selected_mgr)
         
         st.download_button(
-            label="Click Here to Download Reconciled .docx Report",
+            label="Download Reconciled .docx Report",
             data=docx_file,
             file_name="Punch_Edit_Audit_And_Compliance_Report.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
