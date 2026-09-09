@@ -13,45 +13,29 @@ import re
 st.set_page_config(page_title="Payroll Audit Generator", layout="centered")
 
 st.title("Payroll Audit Report Generator")
-st.write("Upload your POS CSV Log and PDF Packet to perform a pay-period aggregated reconciliation and generate your Word audit report.")
+st.write("Upload your POS CSV Log and PDF Packet to perform a fuzzy-matched line-by-line reconciliation.")
 
 uploaded_csv = st.file_uploader("Upload POS CSV Log", type=["csv"])
 uploaded_pdf = st.file_uploader("Upload Signed PDF Packet", type=["pdf"])
 
-def extract_pdf_records(pdf_file):
-    """
-    Extracts text from PDF and builds a structured lookup map of 
-    (Normalized Employee Name, Normalized Date) present on physical signed forms.
-    """
-    pdf_records = set()
-    pdf_full_text = ""
-    
+def extract_pdf_clean_text(pdf_file):
+    """Extracts all text from PDF pages and normalizes whitespace/casing."""
+    pdf_text = ""
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            text = page.extract_text()
-            if not text:
-                continue
-            pdf_full_text += text + "\n"
-            
-            lines = text.split('\n')
-            for line in lines:
-                clean_line = line.upper().strip()
-                dates = re.findall(r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b', clean_line)
-                
-                if dates:
-                    for d in dates:
-                        # Extract valid employee names (words >= 3 letters)
-                        words = re.findall(r'[A-Z]{3,}', clean_line)
-                        for word in words:
-                            pdf_records.add((word, d))
-                            
-    return pdf_records, pdf_full_text
+            t = page.extract_text()
+            if t:
+                pdf_text += t.upper() + "\n---PAGE---\n"
+    return pdf_text
+
+def parse_name_tokens(raw_name):
+    """Breaks employee name into significant search tokens (ignoring middle initials/roles)."""
+    clean_name = re.sub(r'[^A-Z\s]', '', str(raw_name).upper())
+    tokens = [w for w in clean_name.split() if len(w) >= 3 and w not in ["SERVER", "BUSSER", "HOST", "KITCHEN", "COOK", "MGR"]]
+    return tokens
 
 def process_audit_reconciliation(csv_df, pdf_file):
-    """
-    Performs line-by-line matching and aggregates data by Pay Period Ending (PPE) dates.
-    """
-    # Clean CSV column names
+    # Clean CSV columns
     csv_df.columns = [str(c).strip() for c in csv_df.columns]
     
     # Identify key columns dynamically
@@ -59,50 +43,57 @@ def process_audit_reconciliation(csv_df, pdf_file):
     date_col = next((c for c in csv_df.columns if "date" in c.lower() or "shift" in c.lower()), csv_df.columns[1] if len(csv_df.columns) > 1 else csv_df.columns[0])
     mgr_col = next((c for c in csv_df.columns if "manager" in c.lower() or "editor" in c.lower() or "user" in c.lower()), csv_df.columns[3] if len(csv_df.columns) > 3 else csv_df.columns[0])
 
-    # Convert Date column to actual DateTime objects to group by 14-day Pay Periods
+    # Convert Date column to actual DateTime objects
     csv_df['_ParsedDate'] = pd.to_datetime(csv_df[date_col], errors='coerce')
-    
-    # Drop invalid date rows if any
     csv_df = csv_df.dropna(subset=['_ParsedDate']).copy()
     csv_df = csv_df.sort_values('_ParsedDate')
 
-    # Extract text & records from PDF
-    pdf_records, pdf_full_text = extract_pdf_records(pdf_file)
-    pdf_text_upper = pdf_full_text.upper()
+    # Extract clean text from PDF
+    pdf_text = extract_pdf_clean_text(pdf_file)
 
     verified_flags = []
+    match_notes = []
 
     for _, row in csv_df.iterrows():
-        emp_name = str(row[emp_col]).strip().upper()
-        raw_date_str = row['_ParsedDate'].strftime('%m/%d/%Y')
-        short_date_str = row['_ParsedDate'].strftime('%m/%d/%y')
-
-        name_parts = [p for p in re.findall(r'[A-Z]{3,}', emp_name) if p not in ["THE", "AND", "SERVER", "BUSSER", "HOST", "KITCHEN"]]
+        raw_name = row[emp_col]
+        name_tokens = parse_name_tokens(raw_name)
+        
+        shift_dt = row['_ParsedDate']
+        # Extract multiple date string variants (e.g. 01/20/2026, 1/20/26, 01/20)
+        date_variants = [
+            shift_dt.strftime('%m/%d/%Y'),
+            shift_dt.strftime('%m/%d/%y'),
+            f"{shift_dt.month}/{shift_dt.day}/{shift_dt.year}",
+            f"{shift_dt.month}/{shift_dt.day}/{shift_dt.strftime('%y')}",
+            shift_dt.strftime('%m/%d')
+        ]
 
         is_verified = False
-        if name_parts:
-            for part in name_parts:
-                # Check tuple match
-                if (part, raw_date_str) in pdf_records or (part, short_date_str) in pdf_records:
-                    is_verified = True
-                    break
-                # Fallback check in full text
-                if part in pdf_text_upper and (raw_date_str in pdf_text_upper or short_date_str in pdf_text_upper):
-                    is_verified = True
+        note = "Missing Form"
+
+        if name_tokens:
+            # Check if at least one significant name token (e.g., Last Name) AND a date variant appear in the same PDF block
+            for token in name_tokens:
+                if token in pdf_text:
+                    for d_var in date_variants:
+                        if d_var in pdf_text:
+                            is_verified = True
+                            note = f"Matched Token: {token} & Date: {d_var}"
+                            break
+                if is_verified:
                     break
 
         verified_flags.append(is_verified)
+        match_notes.append(note)
 
     csv_df["_Verified"] = verified_flags
+    csv_df["_MatchNote"] = match_notes
 
-    # Assign Bi-Weekly Pay Period Ending (PPE) Dates (Grouping into 14-day blocks)
-    # Group dates by 14-day frequency ending on the max date
+    # Assign Bi-Weekly Pay Period Ending (PPE) Dates
     min_date = csv_df['_ParsedDate'].min()
     csv_df['_PPE_Group'] = csv_df['_ParsedDate'].apply(lambda d: (min_date + pd.Timedelta(days=13 * ((d - min_date).days // 14) + 13)).strftime('%m/%d/%Y'))
 
-    # -------------------------------------------------------------
-    # 1. SECTION 1 TABLE: Aggregate by Pay Period Ending (PPE)
-    # -------------------------------------------------------------
+    # SECTION 1 TABLE: Aggregate by Pay Period
     period_summary = []
     total_edits = len(csv_df)
     total_verified = int(sum(verified_flags))
@@ -119,9 +110,7 @@ def process_audit_reconciliation(csv_df, pdf_file):
     overall_rate = f"{(total_verified / total_edits * 100):.1f}%" if total_edits > 0 else "0.0%"
     period_summary.append(["COMBINED TOTALS", str(total_edits), str(total_verified), str(total_missing), overall_rate])
 
-    # -------------------------------------------------------------
-    # 2. SECTION 2 TABLE: Manager Attribution
-    # -------------------------------------------------------------
+    # SECTION 2 TABLE: Manager Attribution
     manager_summary = []
     grouped_mgr = csv_df.groupby(mgr_col)
     for mgr_val, group in grouped_mgr:
@@ -135,9 +124,7 @@ def process_audit_reconciliation(csv_df, pdf_file):
 
     return period_summary, manager_summary, csv_df
 
-def build_styled_docx(csv_df, pdf_file):
-    rows_s1, rows_s2, processed_df = process_audit_reconciliation(csv_df, pdf_file)
-
+def build_styled_docx(processed_df, rows_s1, rows_s2):
     doc = docx.Document()
 
     for section in doc.sections:
@@ -147,7 +134,6 @@ def build_styled_docx(csv_df, pdf_file):
         section.right_margin = Inches(1)
 
     NAVY = "1B365D"
-    STEEL_BLUE = "5C768D"
     LIGHT_BG = "F0F4F8"
     BORDER_GREY = "D3D3D3"
 
@@ -239,9 +225,7 @@ def build_styled_docx(csv_df, pdf_file):
                         if c_idx == len(row) - 1:
                             run.font.color.rgb = RGBColor(0xA6, 0x1C, 0x1C)
 
-    # -------------------------------------------------------------
     # DOCUMENT HEADER
-    # -------------------------------------------------------------
     p_title = doc.add_paragraph()
     p_title.paragraph_format.space_after = Pt(2)
     r_title = p_title.add_run("PUNCH EDIT AUDIT & COMPLIANCE RECONCILIATION REPORT")
@@ -284,55 +268,31 @@ def build_styled_docx(csv_df, pdf_file):
     r_box_body.font.size = Pt(9.5)
     r_box_body.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
 
-    # -------------------------------------------------------------
-    # SECTION 1: EXECUTIVE SUMMARY
-    # -------------------------------------------------------------
+    # SECTION 1
     add_section_header("1. Executive Summary & Period Audit Findings")
-    
-    p_exec = doc.add_paragraph(
-        "A comprehensive wage and hour compliance audit was conducted reconciling electronic POS system edit logs "
-        "against physical paper documentation packets. Under California Labor Code Sections 226.7 and 512, any manual "
-        "adjustment to an employee's timecard requires a fully executed, employee-signed paper form."
-    )
-    p_exec.style.font.name = "Calibri"
-    p_exec.style.font.size = Pt(10.5)
-
     headers_s1 = ["Pay Period Ending (PPE)", "Total System Edits", "Forms Verified", "Forms Missing", "Compliance Rate"]
     create_and_format_table(headers_s1, rows_s1)
 
-    # -------------------------------------------------------------
-    # SECTION 2: MANAGER BREAKDOWN
-    # -------------------------------------------------------------
+    # SECTION 2
     add_section_header("2. Manager Attribution & Compliance Performance")
-    
-    p_mgr = doc.add_paragraph("The table below attributes system timecard edits executed during the audit period to the specific editing manager logged in the POS audit system:")
-    p_mgr.style.font.name = "Calibri"
-    p_mgr.style.font.size = Pt(10.5)
-
     headers_s2 = ["Editing Manager / Editor", "Total Edits Executed", "Supported by Form", "Missing Form", "Manager Compliance %"]
     create_and_format_table(headers_s2, rows_s2)
 
-    # -------------------------------------------------------------
-    # SECTION 3: DETAILED FINDINGS BY PAY PERIOD
-    # -------------------------------------------------------------
+    # SECTION 3
     add_section_header("3. Detailed Findings & Itemized System Audit Log")
-
     raw_cols = [c for c in processed_df.columns if not c.startswith("_")][:5]
     display_df = processed_df[raw_cols].copy()
     display_df["Audit Status"] = processed_df["_Verified"].apply(lambda x: "MATCH (Signed Form Present)" if x else "DISCREPANCY (Missing Form)")
 
     headers_s3 = raw_cols + ["Audit Status"]
     csv_rows = display_df.fillna("N/A").values.tolist()
-
     create_and_format_table(headers_s3, csv_rows)
 
-    # -------------------------------------------------------------
-    # SECTION 4: RISK ANALYSIS & ACTION PLAN
-    # -------------------------------------------------------------
+    # SECTION 4
     add_section_header("4. Risk Analysis & Corrective Action Plan")
-
+    defect_pct = (tot_mis / total_recs * 100) if total_recs > 0 else 0.0
     risk_points = [
-        ("1. Documentation Exposure:", f"Out of {total_recs} manual edits executed in the system, {tot_mis} edits ({(tot_mis/total_recs*100):.1f}%) lack required employee-signed paper forms. Post-shift meal break additions and time reductions present severe liability under California Labor Code Section 226.7."),
+        ("1. Documentation Exposure:", f"Out of {total_recs} manual edits executed in the system, {tot_mis} edits ({defect_pct:.1f}%) lack required employee-signed paper forms. Post-shift meal break additions and time reductions present severe liability under California Labor Code Section 226.7."),
         ("2. Manager Compliance Gaps:", "Editing managers with compliance rates below 80% must be audited weekly and retrained on physical punch form collection protocol."),
         ("3. Recommended Operational Controls:", "Enforce a mandatory digital form attachment block in the POS before allowing manager overrides, and lock payroll processing until form reconciliation is 100% complete.")
     ]
@@ -341,12 +301,10 @@ def build_styled_docx(csv_df, pdf_file):
         p_risk = doc.add_paragraph()
         p_risk.paragraph_format.space_before = Pt(4)
         p_risk.paragraph_format.space_after = Pt(4)
-        
         r_rtitle = p_risk.add_run(f"{title} ")
         r_rtitle.font.name = "Calibri"
         r_rtitle.font.size = Pt(10.5)
         r_rtitle.font.bold = True
-        
         r_rdesc = p_risk.add_run(desc)
         r_rdesc.font.name = "Calibri"
         r_rdesc.font.size = Pt(10.5)
@@ -357,15 +315,29 @@ def build_styled_docx(csv_df, pdf_file):
     return buffer
 
 if uploaded_csv and uploaded_pdf:
-    st.success("Files loaded successfully!")
+    st.success("Files uploaded successfully!")
+    
+    csv_data = pd.read_csv(uploaded_csv)
+    
+    with st.spinner("Executing fuzzy reconciliation engine..."):
+        rows_s1, rows_s2, processed_df = process_audit_reconciliation(csv_data, uploaded_pdf)
+    
+    # Show real-time calculation preview directly in Streamlit
+    total_found = int(processed_df["_Verified"].sum())
+    total_lines = len(processed_df)
+    comp_rate = (total_found / total_lines * 100) if total_lines > 0 else 0.0
+    
+    st.metric("Reconciliation Match Results", f"{comp_rate:.1f}% Compliance", f"{total_found} of {total_lines} Edits Verified")
+    
+    with st.expander("Preview Reconciliation Match Details (First 10 Rows)"):
+        st.dataframe(processed_df[[c for c in processed_df.columns if not c.startswith("_")][:3] + ["_Verified", "_MatchNote"]].head(10))
+
     if st.button("Generate & Download Reconciled Word Report"):
-        with st.spinner("Aggregating pay periods and performing reconciliation..."):
-            csv_data = pd.read_csv(uploaded_csv)
-            docx_file = build_styled_docx(csv_data, uploaded_pdf)
-            
-            st.download_button(
-                label="Click Here to Download Reconciled .docx Report",
-                data=docx_file,
-                file_name="Punch_Edit_Audit_And_Compliance_Report.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
+        docx_file = build_styled_docx(processed_df, rows_s1, rows_s2)
+        
+        st.download_button(
+            label="Click Here to Download Reconciled .docx Report",
+            data=docx_file,
+            file_name="Punch_Edit_Audit_And_Compliance_Report.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
