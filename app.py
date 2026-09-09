@@ -8,7 +8,7 @@ import pytesseract
 
 
 def extract_text_with_ocr(pdf_bytes: bytes) -> list[str]:
-    """Converts PDF pages into images and runs OCR to extract text from scanned forms."""
+    """Converts scanned PDF pages into images and runs OCR to extract text from forms."""
     images = convert_from_bytes(pdf_bytes)
     page_texts = []
     for img in images:
@@ -30,7 +30,7 @@ def process_toast_csv(csv_files) -> pd.DataFrame:
 
 
 def get_date_variants(date_str) -> list[str]:
-    """Generates short date variants (e.g., '8/7', '08/07', '8/7/26') for OCR matching."""
+    """Generates short date variants (e.g., '8/7', '08/07', '8/7/26') for matching."""
     if pd.isna(date_str):
         return []
     
@@ -41,38 +41,37 @@ def get_date_variants(date_str) -> list[str]:
             f"{m}/{d}",
             f"{m:02d}/{d:02d}",
             f"{m}/{d}/{y}",
-            f"{m:02d}/{d:02d}/{y}",
-            f"{m}/{d}/{dt.year}"
+            f"{m:02d}/{d:02d}/{y}"
         ]
     except Exception:
         return [str(date_str).strip()]
 
 
-def clean_name_tokens(name_str: str) -> list[str]:
-    """Splits Toast 'Last, First' names into individual searchable name tokens."""
+def get_name_tokens(name_str: str) -> list[str]:
+    """Extracts major name parts, ignoring common filler terms."""
     if pd.isna(name_str):
         return []
-    # Clean common suffixes or punctuation
-    parts = re.split(r"[\s,]+", str(name_str))
-    # Filter out short tokens or common middle initial noises
-    return [p.strip() for ppart in parts for p in [ppart] if len(p) > 2]
+    parts = re.split(r"[\s,]+", str(name_str).strip())
+    # Exclude system filler words or short noise tokens
+    ignore = {"pm", "bar", "boh", "foh", "take", "out", "lunch", "ghost", "drawer"}
+    return [p for p in parts if len(p) >= 3 and p.lower() not in ignore]
 
 
 def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Analyzes manager edits and checks against OCR PDF pages."""
-    # Column mapping for Toast POS export
+    """Matches CSV edits against scanned PDF pages using token search."""
     mgr_col = next((c for c in df.columns if "Manager" in c or "Edited" in c), "Manager")
     emp_col = next((c for c in df.columns if "Employee" in c), "Employee")
     change_col = next((c for c in df.columns if "Change" in c), None)
     in_date_col = next((c for c in df.columns if "In Date" in c or "Date" in c), None)
 
-    # Filter out 'CREATE' actions (keep edits/modifications)
     filtered = df.copy()
+    
+    # Filter out CREATE entries (keep manager edits like MODIFY/DELETE)
     if change_col and change_col in filtered.columns:
         filtered = filtered[filtered[change_col] != "CREATE"]
 
-    # Exclude system and ghost entries
-    system_terms = ["system", "ghost", "house", "auto", "toast"]
+    # Filter system / ghost entries
+    system_terms = ["system", "ghost", "house", "auto", "toast", "drawer"]
     pattern = "|".join(system_terms)
     
     filtered = filtered[
@@ -87,17 +86,20 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
         employee = str(row[emp_col]).strip()
         raw_date = row[in_date_col] if in_date_col else None
 
-        name_tokens = clean_name_tokens(employee)
+        tokens = get_name_tokens(employee)
         date_vars = get_date_variants(raw_date)
 
         matched = False
         for page_text in ocr_pages:
-            # Check if at least 2 primary name tokens (e.g. First & Last) appear on the page
-            name_hits = sum(1 for token in name_tokens if re.search(r"\b" + re.escape(token) + r"\b", page_text, re.IGNORECASE))
-            has_name = name_hits >= min(2, len(name_tokens)) if name_tokens else False
+            # Match if at least one primary name token (First or Last name) appears on the page
+            token_matches = [
+                t for t in tokens 
+                if re.search(r"\b" + re.escape(t[:4]) + r"[a-z]*\b", page_text, re.IGNORECASE)
+            ]
+            has_name = len(token_matches) >= 1 if tokens else False
 
-            # Check date match on page
-            has_date = any(re.search(re.escape(d), page_text) for d in date_vars) if date_vars else True
+            # Match date if present
+            has_date = any(d in page_text for d in date_vars) if date_vars else True
 
             if has_name and has_date:
                 matched = True
@@ -116,7 +118,6 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
         summary_df = pd.DataFrame(columns=["Manager", "Total_Edits", "Forms_Present", "Forms_Missing", "Compliance_Pct"])
         return summary_df, details_df
 
-    # Aggregate by Manager
     summary_df = details_df.groupby("Manager").agg(
         Total_Edits=("Has_Signed_Form", "count"),
         Forms_Present=("Has_Signed_Form", "sum")
@@ -129,11 +130,11 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
 
 
 def create_word_docx(summary_df: pd.DataFrame, details_df: pd.DataFrame) -> io.BytesIO:
-    """Generates audit summary report in Word document format."""
+    """Generates the downloadable Word audit summary."""
     doc = Document()
     doc.add_heading("Toast POS Time Edit Audit Report", level=1)
 
-    doc.add_heading("1. Manager Summary", level=2)
+    doc.add_heading("Manager Audit Summary", level=2)
     table = doc.add_table(rows=1, cols=5)
     table.style = "Table Grid"
     hdr = table.rows[0].cells
@@ -148,10 +149,10 @@ def create_word_docx(summary_df: pd.DataFrame, details_df: pd.DataFrame) -> io.B
             str(row["Forms_Missing"]), f"{row['Compliance_Pct']}%"
         )
 
-    doc.add_heading("2. Missing Forms Detail", level=2)
+    doc.add_heading("Missing Forms Detail", level=2)
     missing = details_df[~details_df["Has_Signed_Form"]]
     if missing.empty:
-        doc.add_paragraph("All edits have corresponding signed forms present.")
+        doc.add_paragraph("All manager edits have corresponding signed forms present.")
     else:
         m_table = doc.add_table(rows=1, cols=3)
         m_table.style = "Table Grid"
@@ -184,7 +185,7 @@ if st.button("Process & Generate Audit", type="primary"):
     if not csv_files or not pdf_files:
         st.error("Please upload both CSV and PDF files.")
     else:
-        with st.spinner("Running OCR on scanned PDFs and matching edits..."):
+        with st.spinner("Processing OCR on scanned PDFs and running audit..."):
             all_ocr_pages = []
             for pdf_file in pdf_files:
                 pages = extract_text_with_ocr(pdf_file.read())
