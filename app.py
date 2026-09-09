@@ -1,5 +1,6 @@
 import io
 import re
+import difflib
 import pandas as pd
 import streamlit as st
 from docx import Document
@@ -58,8 +59,18 @@ def get_name_tokens(name_str: str) -> list[str]:
     return [p for p in parts if len(p) >= 3 and p.lower() not in ignore and not p.isdigit()]
 
 
+def fuzzy_match_tokens(csv_tokens: list[str], ocr_text: str, threshold: float = 0.65) -> bool:
+    """Handles handwritten OCR typos (e.g. matching 'Silva' with 'Siles')."""
+    words = [w.strip(".,;:()") for w in re.split(r"\s+", ocr_text) if len(w) >= 3]
+    for ct in csv_tokens:
+        for ow in words:
+            if difflib.SequenceMatcher(None, ct.lower(), ow.lower()).ratio() >= threshold:
+                return True
+    return False
+
+
 def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Matches CSV edits against scanned PDF pages ensuring 1 PDF sheet matches max 1 shift edit."""
+    """Page-first audit engine ensuring each PDF sheet matches its corresponding CSV entry."""
     
     emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
     mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower()), df.columns[1])
@@ -69,7 +80,7 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
 
     filtered = df.copy()
     
-    # Filter out CREATE entries
+    # Filter out CREATE entries (keep manager modifications/deletions)
     if change_col and change_col in filtered.columns:
         filtered = filtered[filtered[change_col] != "CREATE"]
 
@@ -80,63 +91,65 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
     filtered = filtered[
         ~filtered[emp_col].astype(str).str.lower().str.contains(pattern, na=False) &
         ~filtered[mgr_col].astype(str).str.lower().str.contains(pattern, na=False)
-    ].dropna(subset=[mgr_col])
+    ].dropna(subset=[mgr_col]).copy()
 
-    details = []
-    matched_pages = set()  # Track PDF page indices that have already been matched
+    # Flag column for form match
+    filtered["Has_Signed_Form"] = False
+    used_csv_indices = set()
 
-    for _, row in filtered.iterrows():
-        manager = str(row[mgr_col]).strip()
-        employee = str(row[emp_col]).strip()
-        
-        shift_date_raw = row[in_date_col] if in_date_col else None
-        edit_time_raw = row[time_edit_col] if time_edit_col else None
+    # PROCESS PDF PAGES FIRST
+    for page_idx, page_text in enumerate(ocr_pages):
+        # Ignore pages that are paycheck rosters or cover sheets lacking request text
+        if "EDITED PUNCH REQUEST" not in page_text.upper() and "SOLICITUD" not in page_text.upper():
+            continue
 
-        tokens = get_name_tokens(employee)
-        date_vars = get_date_variants(shift_date_raw) + get_date_variants(edit_time_raw)
+        best_match_idx = None
 
-        matched = False
-        
-        # Pass 1: Strict match (Employee Name AND Date on same unused PDF page)
-        for page_idx, page_text in enumerate(ocr_pages):
-            if page_idx in matched_pages:
+        # Pass 1: Strict Match (Name AND Date match)
+        for idx, row in filtered.iterrows():
+            if idx in used_csv_indices:
                 continue
 
-            token_matches = [
-                t for t in tokens 
-                if re.search(r"\b" + re.escape(t[:4]) + r"[a-z]*\b", page_text, re.IGNORECASE)
-            ]
-            has_name = len(token_matches) >= 1 if tokens else False
+            employee = str(row[emp_col]).strip()
+            tokens = get_name_tokens(employee)
+            date_vars = get_date_variants(row[in_date_col]) + (get_date_variants(row[time_edit_col]) if time_edit_col else [])
+
+            has_name = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", page_text, re.IGNORECASE) for t in tokens) or fuzzy_match_tokens(tokens, page_text)
             has_date = any(d in page_text for d in date_vars) if date_vars else True
 
             if has_name and has_date:
-                matched = True
-                matched_pages.add(page_idx)
+                best_match_idx = idx
                 break
 
-        # Pass 2: Name-only fallback on unused PDF pages
-        if not matched:
-            for page_idx, page_text in enumerate(ocr_pages):
-                if page_idx in matched_pages:
+        # Pass 2: Name-Only Fallback Match for this page
+        if best_match_idx is None:
+            for idx, row in filtered.iterrows():
+                if idx in used_csv_indices:
                     continue
 
-                token_matches = [
-                    t for t in tokens 
-                    if re.search(r"\b" + re.escape(t[:4]) + r"[a-z]*\b", page_text, re.IGNORECASE)
-                ]
-                if len(token_matches) >= 1:
-                    matched = True
-                    matched_pages.add(page_idx)
+                employee = str(row[emp_col]).strip()
+                tokens = get_name_tokens(employee)
+                has_name = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", page_text, re.IGNORECASE) for t in tokens) or fuzzy_match_tokens(tokens, page_text)
+
+                if has_name:
+                    best_match_idx = idx
                     break
 
-        details.append({
-            "Manager": manager,
-            "Employee": employee,
-            "Edit_Date": str(shift_date_raw) if shift_date_raw else "N/A",
-            "Has_Signed_Form": matched
+        if best_match_idx is not None:
+            filtered.loc[best_match_idx, "Has_Signed_Form"] = True
+            used_csv_indices.add(best_match_idx)
+
+    # Build summary and details DataFrames
+    details_list = []
+    for _, row in filtered.iterrows():
+        details_list.append({
+            "Manager": str(row[mgr_col]).strip(),
+            "Employee": str(row[emp_col]).strip(),
+            "Edit_Date": str(row[in_date_col]) if in_date_col else "N/A",
+            "Has_Signed_Form": row["Has_Signed_Form"]
         })
 
-    details_df = pd.DataFrame(details)
+    details_df = pd.DataFrame(details_list)
 
     if details_df.empty:
         summary_df = pd.DataFrame(columns=["Manager", "Total_Edits", "Forms_Present", "Forms_Missing", "Compliance_Pct"])
@@ -154,7 +167,7 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
 
 
 def create_word_docx(summary_df: pd.DataFrame, details_df: pd.DataFrame) -> io.BytesIO:
-    """Generates downloadable Word audit summary."""
+    """Generates downloadable Word audit summary report."""
     doc = Document()
     doc.add_heading("Toast POS Time Edit Audit Report", level=1)
 
@@ -209,7 +222,7 @@ if st.button("Process & Generate Audit", type="primary"):
     if not csv_files or not pdf_files:
         st.error("Please upload both CSV and PDF files.")
     else:
-        with st.spinner("Processing OCR on scanned PDFs and running audit..."):
+        with st.spinner("Running page-by-page OCR and matching edits..."):
             all_ocr_pages = []
             for pdf_file in pdf_files:
                 pdf_bytes = pdf_file.getvalue()
