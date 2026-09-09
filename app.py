@@ -79,7 +79,6 @@ def extract_time_from_datetime(datetime_val) -> str:
         dt = pd.to_datetime(val_str)
         return dt.strftime("%I:%M %p").lstrip("0")
     except Exception:
-        # Fallback regex extraction for time pattern
         match = re.search(r"\d{1,2}:\d{2}(?:\s*[AP]M)?", val_str, re.IGNORECASE)
         return match.group(0) if match else val_str
 
@@ -202,9 +201,24 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
 
 
 def create_word_docx(summary_df: pd.DataFrame, details_df: pd.DataFrame) -> io.BytesIO:
-    """Generates downloadable Word audit summary report."""
+    """Generates downloadable Word audit summary report with overall stats at top."""
     doc = Document()
     doc.add_heading("Toast POS Time Edit Audit Report", level=1)
+
+    # Calculate overall metrics
+    total_edits = summary_df["Total_Edits"].sum() if not summary_df.empty else 0
+    total_forms = summary_df["Forms_Present"].sum() if not summary_df.empty else 0
+    overall_pct = round((total_forms / total_edits) * 100, 1) if total_edits > 0 else 0.0
+
+    # Top Overview Metrics Section
+    doc.add_heading("Audit Executive Summary", level=2)
+    p = doc.add_paragraph()
+    p.add_run("Total Manager Edits: ").bold = True
+    p.add_run(f"{total_edits}\n")
+    p.add_run("Signed Forms Found: ").bold = True
+    p.add_run(f"{total_forms}\n")
+    p.add_run("Overall Compliance Rate: ").bold = True
+    p.add_run(f"{overall_pct}%")
 
     doc.add_heading("Manager Audit Summary", level=2)
     table = doc.add_table(rows=1, cols=5)
@@ -278,6 +292,7 @@ if st.button("Process & Generate Audit", type="primary"):
             total_forms = summary_df["Forms_Present"].sum() if not summary_df.empty else 0
             overall_pct = round((total_forms / total_edits) * 100, 1) if total_edits > 0 else 0
 
+            # Display metrics at top of Streamlit UI
             m1, m2, m3 = st.columns(3)
             m1.metric("Total Manager Edits", total_edits)
             m2.metric("Signed Forms Found", total_forms)
