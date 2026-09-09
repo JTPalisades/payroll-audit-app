@@ -52,25 +52,26 @@ def get_name_tokens(name_str: str) -> list[str]:
     if pd.isna(name_str):
         return []
     parts = re.split(r"[\s,]+", str(name_str).strip())
-    # Exclude system filler words or short noise tokens
-    ignore = {"pm", "bar", "boh", "foh", "take", "out", "lunch", "ghost", "drawer"}
-    return [p for p in parts if len(p) >= 3 and p.lower() not in ignore]
+    ignore = {"pm", "bar", "boh", "foh", "take", "out", "lunch", "ghost", "drawer", "id"}
+    return [p for p in parts if len(p) >= 3 and p.lower() not in ignore and not p.isdigit()]
 
 
 def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Matches CSV edits against scanned PDF pages using token search."""
-    mgr_col = next((c for c in df.columns if "Manager" in c or "Edited" in c), "Manager")
-    emp_col = next((c for c in df.columns if "Employee" in c), "Employee")
-    change_col = next((c for c in df.columns if "Change" in c), None)
-    in_date_col = next((c for c in df.columns if "In Date" in c or "Date" in c), None)
+    
+    # Exact column matching to prevent picking 'Employee Id' over 'Employee'
+    emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
+    mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower()), df.columns[1])
+    change_col = "Change" if "Change" in df.columns else next((c for c in df.columns if "change" in c.lower()), None)
+    in_date_col = "In Date" if "In Date" in df.columns else next((c for c in df.columns if "date" in c.lower()), None)
 
     filtered = df.copy()
     
-    # Filter out CREATE entries (keep manager edits like MODIFY/DELETE)
+    # Filter out CREATE entries
     if change_col and change_col in filtered.columns:
         filtered = filtered[filtered[change_col] != "CREATE"]
 
-    # Filter system / ghost entries
+    # Exclude system / ghost entries
     system_terms = ["system", "ghost", "house", "auto", "toast", "drawer"]
     pattern = "|".join(system_terms)
     
@@ -91,7 +92,7 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
 
         matched = False
         for page_text in ocr_pages:
-            # Match if at least one primary name token (First or Last name) appears on the page
+            # Match if at least one primary name token appears on page
             token_matches = [
                 t for t in tokens 
                 if re.search(r"\b" + re.escape(t[:4]) + r"[a-z]*\b", page_text, re.IGNORECASE)
