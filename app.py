@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import pdfplumber
+import pytesseract
+from pdf2image import convert_from_bytes
 import docx
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -13,43 +15,55 @@ import re
 st.set_page_config(page_title="Payroll Audit Generator", layout="centered")
 
 st.title("Payroll Audit Report Generator")
-st.write("Upload your POS CSV Log and PDF Packet to perform a fuzzy-matched line-by-line reconciliation.")
+st.write("Upload your POS CSV Log and PDF Packet (digital or scanned) to perform line-by-line reconciliation.")
 
 uploaded_csv = st.file_uploader("Upload POS CSV Log", type=["csv"])
-uploaded_pdf = st.file_uploader("Upload Signed PDF Packet", type=["pdf"])
+uploaded_pdf = st.file_uploader("Upload Signed PDF Packet (Scanned or Digital)", type=["pdf"])
 
-def extract_pdf_clean_text(pdf_file):
-    """Extracts all text from PDF pages and normalizes whitespace/casing."""
-    pdf_text = ""
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
+def extract_pdf_clean_text_with_ocr(pdf_file):
+    """Extracts text using pdfplumber, falling back to OCR for scanned pages."""
+    pdf_bytes = pdf_file.read()
+    pdf_file.seek(0) # Reset stream pointer
+    
+    full_text = ""
+    
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page_num, page in enumerate(pdf.pages):
             t = page.extract_text()
-            if t:
-                pdf_text += t.upper() + "\n---PAGE---\n"
-    return pdf_text
+            # If standard extraction yields little/no text, run OCR on the page
+            if not t or len(t.strip()) < 10:
+                try:
+                    # Convert single PDF page to image
+                    images = convert_from_bytes(pdf_bytes, first_page=page_num+1, last_page=page_num+1)
+                    if images:
+                        ocr_text = pytesseract.image_to_string(images[0])
+                        full_text += ocr_text.upper() + "\n"
+                except Exception as e:
+                    pass
+            else:
+                full_text += t.upper() + "\n"
+                
+    return full_text
 
 def parse_name_tokens(raw_name):
-    """Breaks employee name into significant search tokens (ignoring middle initials/roles)."""
+    """Extracts search tokens (names >= 3 chars, filtering out roles)."""
     clean_name = re.sub(r'[^A-Z\s]', '', str(raw_name).upper())
     tokens = [w for w in clean_name.split() if len(w) >= 3 and w not in ["SERVER", "BUSSER", "HOST", "KITCHEN", "COOK", "MGR"]]
     return tokens
 
 def process_audit_reconciliation(csv_df, pdf_file):
-    # Clean CSV columns
     csv_df.columns = [str(c).strip() for c in csv_df.columns]
     
-    # Identify key columns dynamically
     emp_col = next((c for c in csv_df.columns if "employee" in c.lower() or "name" in c.lower()), csv_df.columns[0])
     date_col = next((c for c in csv_df.columns if "date" in c.lower() or "shift" in c.lower()), csv_df.columns[1] if len(csv_df.columns) > 1 else csv_df.columns[0])
     mgr_col = next((c for c in csv_df.columns if "manager" in c.lower() or "editor" in c.lower() or "user" in c.lower()), csv_df.columns[3] if len(csv_df.columns) > 3 else csv_df.columns[0])
 
-    # Convert Date column to actual DateTime objects
     csv_df['_ParsedDate'] = pd.to_datetime(csv_df[date_col], errors='coerce')
     csv_df = csv_df.dropna(subset=['_ParsedDate']).copy()
     csv_df = csv_df.sort_values('_ParsedDate')
 
-    # Extract clean text from PDF
-    pdf_text = extract_pdf_clean_text(pdf_file)
+    # Run OCR / Text extraction
+    pdf_text = extract_pdf_clean_text_with_ocr(pdf_file)
 
     verified_flags = []
     match_notes = []
@@ -59,7 +73,6 @@ def process_audit_reconciliation(csv_df, pdf_file):
         name_tokens = parse_name_tokens(raw_name)
         
         shift_dt = row['_ParsedDate']
-        # Extract multiple date string variants (e.g. 01/20/2026, 1/20/26, 01/20)
         date_variants = [
             shift_dt.strftime('%m/%d/%Y'),
             shift_dt.strftime('%m/%d/%y'),
@@ -72,7 +85,6 @@ def process_audit_reconciliation(csv_df, pdf_file):
         note = "Missing Form"
 
         if name_tokens:
-            # Check if at least one significant name token (e.g., Last Name) AND a date variant appear in the same PDF block
             for token in name_tokens:
                 if token in pdf_text:
                     for d_var in date_variants:
@@ -89,11 +101,11 @@ def process_audit_reconciliation(csv_df, pdf_file):
     csv_df["_Verified"] = verified_flags
     csv_df["_MatchNote"] = match_notes
 
-    # Assign Bi-Weekly Pay Period Ending (PPE) Dates
+    # Bi-weekly aggregation
     min_date = csv_df['_ParsedDate'].min()
     csv_df['_PPE_Group'] = csv_df['_ParsedDate'].apply(lambda d: (min_date + pd.Timedelta(days=13 * ((d - min_date).days // 14) + 13)).strftime('%m/%d/%Y'))
 
-    # SECTION 1 TABLE: Aggregate by Pay Period
+    # SECTION 1 TABLE
     period_summary = []
     total_edits = len(csv_df)
     total_verified = int(sum(verified_flags))
@@ -110,7 +122,7 @@ def process_audit_reconciliation(csv_df, pdf_file):
     overall_rate = f"{(total_verified / total_edits * 100):.1f}%" if total_edits > 0 else "0.0%"
     period_summary.append(["COMBINED TOTALS", str(total_edits), str(total_verified), str(total_missing), overall_rate])
 
-    # SECTION 2 TABLE: Manager Attribution
+    # SECTION 2 TABLE
     manager_summary = []
     grouped_mgr = csv_df.groupby(mgr_col)
     for mgr_val, group in grouped_mgr:
@@ -225,7 +237,7 @@ def build_styled_docx(processed_df, rows_s1, rows_s2):
                         if c_idx == len(row) - 1:
                             run.font.color.rgb = RGBColor(0xA6, 0x1C, 0x1C)
 
-    # DOCUMENT HEADER
+    # HEADER
     p_title = doc.add_paragraph()
     p_title.paragraph_format.space_after = Pt(2)
     r_title = p_title.add_run("PUNCH EDIT AUDIT & COMPLIANCE RECONCILIATION REPORT")
@@ -319,10 +331,9 @@ if uploaded_csv and uploaded_pdf:
     
     csv_data = pd.read_csv(uploaded_csv)
     
-    with st.spinner("Executing fuzzy reconciliation engine..."):
+    with st.spinner("Running OCR text extraction and line-by-line reconciliation (this takes ~15-30s for scanned PDFs)..."):
         rows_s1, rows_s2, processed_df = process_audit_reconciliation(csv_data, uploaded_pdf)
     
-    # Show real-time calculation preview directly in Streamlit
     total_found = int(processed_df["_Verified"].sum())
     total_lines = len(processed_df)
     comp_rate = (total_found / total_lines * 100) if total_lines > 0 else 0.0
