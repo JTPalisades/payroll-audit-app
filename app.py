@@ -22,17 +22,17 @@ def extract_text_with_ocr_split(pdf_bytes: bytes) -> list[str]:
     for img in images:
         width, height = img.size
         
-        # Split image into Top Half and Bottom Half
+        # Crop Top and Bottom halves of page
         top_half = img.crop((0, 0, width, int(height * 0.52)))
         bottom_half = img.crop((0, int(height * 0.48), width, height))
 
-        # OCR both sections independently
         txt_top = pytesseract.image_to_string(top_half)
         txt_bottom = pytesseract.image_to_string(bottom_half)
 
-        if txt_top and len(txt_top.strip()) > 30:
+        # Include any image section with readable text length
+        if txt_top and len(txt_top.strip()) > 20:
             form_sections.append(txt_top)
-        if txt_bottom and len(txt_bottom.strip()) > 30:
+        if txt_bottom and len(txt_bottom.strip()) > 20:
             form_sections.append(txt_bottom)
 
     return form_sections
@@ -56,7 +56,7 @@ def process_toast_csv(csv_files) -> tuple[pd.DataFrame, str, str, str]:
         raw_loc = str(df_all[loc_col].dropna().iloc[0]).strip()
         location_name = re.sub(r'[^\w\s-]', '', raw_loc).strip().replace(" ", "_")
 
-    # Extract date range from 'In Date' column
+    # Extract date range from 'In Date' or 'shiftDate' column
     in_date_col = "In Date" if "In Date" in df_all.columns else next((c for c in df_all.columns if "date" in c.lower()), None)
     
     date_filename_str = "Audit_Report"
@@ -73,7 +73,7 @@ def process_toast_csv(csv_files) -> tuple[pd.DataFrame, str, str, str]:
 
 
 def get_date_variants(date_val) -> list[str]:
-    """Generates short date variants (e.g., '8/7', '08/07', '8/7/26') for matching."""
+    """Generates short date variants supporting slashes, hyphens, and dot/period separators."""
     if pd.isna(date_val):
         return []
     
@@ -81,13 +81,16 @@ def get_date_variants(date_val) -> list[str]:
         dt = pd.to_datetime(date_val)
         m, d, y = dt.month, dt.day, str(dt.year)[-2:]
         return [
-            f"{m}/{d}",
-            f"{m:02d}/{d:02d}",
-            f"{m}/{d}/{y}",
-            f"{m:02d}/{d:02d}/{y}"
+            # Standard Slash variants: 7/30, 07/30, 7/30/26, 07/30/26
+            f"{m}/{d}", f"{m:02d}/{d:02d}", f"{m}/{d}/{y}", f"{m:02d}/{d:02d}/{y}",
+            # Dot / Period variants: 7.30, 07.30, 7.30.26, 07.30.26, 7.30.2026
+            f"{m}.{d}", f"{m:02d}.{d:02d}", f"{m}.{d}.{y}", f"{m:02d}.{d:02d}.{y}", f"{m}.{d}.{dt.year}",
+            # Hyphen variants: 7-30, 07-30, 7-30-26, 07-30-26
+            f"{m}-{d}", f"{m:02d}-{d:02d}", f"{m}-{d}-{y}", f"{m:02d}-{d:02d}-{y}"
         ]
     except Exception:
-        return [str(date_val).strip()]
+        s = str(date_val).strip()
+        return [s, s.replace("/", "."), s.replace("/", "-")]
 
 
 def get_name_tokens(name_str: str) -> list[str]:
@@ -123,25 +126,15 @@ def extract_time_from_datetime(datetime_val) -> str:
         return match.group(0) if match else val_str
 
 
-def is_valid_form_text(ocr_text: str) -> bool:
-    """Checks if the OCR section contains acknowledgment form markers."""
-    keywords = [
-        "EDITED PUNCH REQUEST", "SOLICITUD DE HORAS", "RECONOSCO QUE EL",
-        "PUNCH REQUEST", "CLOCK IN", "PONCHAR ADENTRO", "CORRECT HOURS"
-    ]
-    txt_upper = ocr_text.upper()
-    return any(kw in txt_upper for kw in keywords)
-
-
 def analyze_edits(df: pd.DataFrame, ocr_sections: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Section-first audit engine matching top/bottom forms against CSV edit rows."""
     
     emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
-    mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower()), df.columns[1])
-    change_col = "Change" if "Change" in df.columns else next((c for c in df.columns if "change" in c.lower()), None)
-    in_date_col = "In Date" if "In Date" in df.columns else next((c for c in df.columns if "date" in c.lower()), None)
+    mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower() or "by" in c.lower()), df.columns[1])
+    change_col = "Change" if "Change" in df.columns else next((c for c in df.columns if "change" in c.lower() or "action" in c.lower()), None)
+    in_date_col = "In Date" if "In Date" in df.columns else next((c for c in df.columns if "date" in c.lower() or "time" in c.lower()), None)
     out_date_col = "Out Date" if "Out Date" in df.columns else None
-    job_title_col = "Job Title" if "Job Title" in df.columns else None
+    job_title_col = "Job Title" if "Job Title" in df.columns else next((c for c in df.columns if "job" in c.lower()), None)
     time_edit_col = "Time" if "Time" in df.columns else None
 
     # 1. Ignore rows where Manager is blank/NaN
@@ -166,11 +159,8 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[str]) -> tuple[pd.DataFra
     filtered["Has_Signed_Form"] = False
     used_csv_indices = set()
 
-    # PROCESS EACH FORM SECTION (TOP AND BOTTOM HALVES)
-    for sec_idx, sec_text in enumerate(ocr_sections):
-        if not is_valid_form_text(sec_text):
-            continue
-
+    # PROCESS EACH OCR SECTION (TOP AND BOTTOM FORM HALVES)
+    for sec_text in ocr_sections:
         best_match_idx = None
 
         # Pass 1: Strict Match (Name AND Date match)
@@ -189,7 +179,7 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[str]) -> tuple[pd.DataFra
                 best_match_idx = idx
                 break
 
-        # Pass 2: Name-Only Fallback Match
+        # Pass 2: Name-Only Fallback Match for this section
         if best_match_idx is None:
             for idx, row in filtered.iterrows():
                 if idx in used_csv_indices:
@@ -332,7 +322,7 @@ if st.button("Process & Generate Audit", type="primary"):
     if not csv_files or not pdf_files:
         st.error("Please upload both CSV and PDF files.")
     else:
-        with st.spinner("Processing multi-form page OCR and matching edits..."):
+        with st.spinner("Running page-by-page OCR and matching edits..."):
             all_ocr_sections = []
             for pdf_file in pdf_files:
                 pdf_bytes = pdf_file.getvalue()
@@ -348,6 +338,7 @@ if st.button("Process & Generate Audit", type="primary"):
             total_forms = summary_df["Forms_Present"].sum() if not summary_df.empty else 0
             overall_pct = round((total_forms / total_edits) * 100, 1) if total_edits > 0 else 0
 
+            # Display metrics in UI
             st.markdown(f"### Audit for **{location_name.replace('_', ' ')}** ({date_display_str})")
             
             m1, m2, m3 = st.columns(3)
