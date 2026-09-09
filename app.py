@@ -8,20 +8,38 @@ from pdf2image import convert_from_bytes
 import pytesseract
 
 
-def extract_text_with_ocr(pdf_bytes: bytes) -> list[str]:
-    """Converts scanned PDF pages into images and runs OCR to extract text page-by-page."""
+def extract_text_with_ocr_split(pdf_bytes: bytes) -> list[str]:
+    """
+    Converts PDF pages to images and splits each page into TOP and BOTTOM halves.
+    This enables detecting two different employee forms printed on the same sheet.
+    """
     if not pdf_bytes:
         return []
+    
     images = convert_from_bytes(pdf_bytes)
-    page_texts = []
+    form_sections = []
+
     for img in images:
-        text = pytesseract.image_to_string(img)
-        page_texts.append(text)
-    return page_texts
+        width, height = img.size
+        
+        # Split image into Top Half and Bottom Half
+        top_half = img.crop((0, 0, width, int(height * 0.52)))
+        bottom_half = img.crop((0, int(height * 0.48), width, height))
+
+        # OCR both sections independently
+        txt_top = pytesseract.image_to_string(top_half)
+        txt_bottom = pytesseract.image_to_string(bottom_half)
+
+        if txt_top and len(txt_top.strip()) > 30:
+            form_sections.append(txt_top)
+        if txt_bottom and len(txt_bottom.strip()) > 30:
+            form_sections.append(txt_bottom)
+
+    return form_sections
 
 
 def process_toast_csv(csv_files) -> tuple[pd.DataFrame, str, str, str]:
-    """Combines Toast POS CSV files, extracts location name, and determines audit date range."""
+    """Combines Toast POS CSV files, extracts store location name, and determines audit date range."""
     dfs = []
     for csv_file in csv_files:
         df = pd.read_csv(csv_file)
@@ -30,7 +48,7 @@ def process_toast_csv(csv_files) -> tuple[pd.DataFrame, str, str, str]:
     df_all = pd.concat(dfs, ignore_index=True)
     df_all.columns = df_all.columns.str.strip()
 
-    # 1. Extract location name
+    # Extract location name
     loc_col = next((c for c in df_all.columns if "location" in c.lower() and "code" not in c.lower()), None)
     location_name = "Location"
     
@@ -38,7 +56,7 @@ def process_toast_csv(csv_files) -> tuple[pd.DataFrame, str, str, str]:
         raw_loc = str(df_all[loc_col].dropna().iloc[0]).strip()
         location_name = re.sub(r'[^\w\s-]', '', raw_loc).strip().replace(" ", "_")
 
-    # 2. Extract date range from 'In Date' column
+    # Extract date range from 'In Date' column
     in_date_col = "In Date" if "In Date" in df_all.columns else next((c for c in df_all.columns if "date" in c.lower()), None)
     
     date_filename_str = "Audit_Report"
@@ -105,8 +123,18 @@ def extract_time_from_datetime(datetime_val) -> str:
         return match.group(0) if match else val_str
 
 
-def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Page-first audit engine with refined employee, break, and timestamp filtering."""
+def is_valid_form_text(ocr_text: str) -> bool:
+    """Checks if the OCR section contains acknowledgment form markers."""
+    keywords = [
+        "EDITED PUNCH REQUEST", "SOLICITUD DE HORAS", "RECONOSCO QUE EL",
+        "PUNCH REQUEST", "CLOCK IN", "PONCHAR ADENTRO", "CORRECT HOURS"
+    ]
+    txt_upper = ocr_text.upper()
+    return any(kw in txt_upper for kw in keywords)
+
+
+def analyze_edits(df: pd.DataFrame, ocr_sections: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Section-first audit engine matching top/bottom forms against CSV edit rows."""
     
     emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
     mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower()), df.columns[1])
@@ -123,7 +151,7 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
     if change_col and change_col in filtered.columns:
         filtered = filtered[filtered[change_col] != "CREATE"]
 
-    # 3. Ignore ghost employees (names containing digits or standard system words)
+    # 3. Ignore ghost employees (names containing digits or system words)
     has_digit_pattern = r"\d"
     system_terms = ["system", "ghost", "house", "auto", "toast", "drawer"]
     system_pattern = "|".join(system_terms)
@@ -138,9 +166,9 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
     filtered["Has_Signed_Form"] = False
     used_csv_indices = set()
 
-    # PROCESS PDF PAGES FIRST
-    for page_idx, page_text in enumerate(ocr_pages):
-        if "EDITED PUNCH REQUEST" not in page_text.upper() and "SOLICITUD" not in page_text.upper():
+    # PROCESS EACH FORM SECTION (TOP AND BOTTOM HALVES)
+    for sec_idx, sec_text in enumerate(ocr_sections):
+        if not is_valid_form_text(sec_text):
             continue
 
         best_match_idx = None
@@ -154,14 +182,14 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
             tokens = get_name_tokens(employee)
             date_vars = get_date_variants(row[in_date_col]) + (get_date_variants(row[time_edit_col]) if time_edit_col else [])
 
-            has_name = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", page_text, re.IGNORECASE) for t in tokens) or fuzzy_match_tokens(tokens, page_text)
-            has_date = any(d in page_text for d in date_vars) if date_vars else True
+            has_name = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", sec_text, re.IGNORECASE) for t in tokens) or fuzzy_match_tokens(tokens, sec_text)
+            has_date = any(d in sec_text for d in date_vars) if date_vars else True
 
             if has_name and has_date:
                 best_match_idx = idx
                 break
 
-        # Pass 2: Name-Only Fallback Match for this page
+        # Pass 2: Name-Only Fallback Match
         if best_match_idx is None:
             for idx, row in filtered.iterrows():
                 if idx in used_csv_indices:
@@ -169,7 +197,7 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
 
                 employee = str(row[emp_col]).strip()
                 tokens = get_name_tokens(employee)
-                has_name = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", page_text, re.IGNORECASE) for t in tokens) or fuzzy_match_tokens(tokens, page_text)
+                has_name = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", sec_text, re.IGNORECASE) for t in tokens) or fuzzy_match_tokens(tokens, sec_text)
 
                 if has_name:
                     best_match_idx = idx
@@ -304,15 +332,15 @@ if st.button("Process & Generate Audit", type="primary"):
     if not csv_files or not pdf_files:
         st.error("Please upload both CSV and PDF files.")
     else:
-        with st.spinner("Running page-by-page OCR and matching edits..."):
-            all_ocr_pages = []
+        with st.spinner("Processing multi-form page OCR and matching edits..."):
+            all_ocr_sections = []
             for pdf_file in pdf_files:
                 pdf_bytes = pdf_file.getvalue()
-                pages = extract_text_with_ocr(pdf_bytes)
-                all_ocr_pages.extend(pages)
+                sections = extract_text_with_ocr_split(pdf_bytes)
+                all_ocr_sections.extend(sections)
 
             csv_df, location_name, date_filename_str, date_display_str = process_toast_csv(csv_files)
-            summary_df, details_df = analyze_edits(csv_df, all_ocr_pages)
+            summary_df, details_df = analyze_edits(csv_df, all_ocr_sections)
 
             st.success("Audit complete!")
 
@@ -320,7 +348,6 @@ if st.button("Process & Generate Audit", type="primary"):
             total_forms = summary_df["Forms_Present"].sum() if not summary_df.empty else 0
             overall_pct = round((total_forms / total_edits) * 100, 1) if total_edits > 0 else 0
 
-            # Display metrics in UI
             st.markdown(f"### Audit for **{location_name.replace('_', ' ')}** ({date_display_str})")
             
             m1, m2, m3 = st.columns(3)
@@ -335,8 +362,6 @@ if st.button("Process & Generate Audit", type="primary"):
             st.dataframe(details_df, use_container_width=True)
 
             docx_buf = create_word_docx(summary_df, details_df, location_name, date_display_str)
-            
-            # Dynamic Filename incorporating Location and Date Range
             report_filename = f"{location_name}_Audit_{date_filename_str}.docx"
 
             st.download_button(
