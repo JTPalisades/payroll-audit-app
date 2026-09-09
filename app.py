@@ -8,10 +8,43 @@ from pdf2image import convert_from_bytes
 import pytesseract
 
 
-def extract_text_with_ocr_split(pdf_bytes: bytes) -> list[tuple[int, str]]:
+def is_valid_edited_punch_form(ocr_text: str) -> bool:
+    """
+    Validates if an OCR text section is a genuine Edited Punch Request form.
+    Rejects paycheck rosters, cover pages, and printed Toast POS report tables.
+    """
+    txt_upper = ocr_text.upper()
+    
+    # Exclude Rosters and Cover sheets
+    roster_reject_terms = [
+        "PAYCHECK SIGNATURES", "PAYROLL SIGNATURES", "FOH PAYCHECK", "BOH PAYCHECK",
+        "CONFIRMATION AND ACKNOWLEDGEMENT OF", "PROPERTIES NAME:", "REST AND MEAL BREAK CONFIRMATION"
+    ]
+    if any(term in txt_upper for term in roster_reject_terms):
+        return False
+        
+    # Exclude printed Toast POS CSV/report pages (containing tabular audit logs)
+    report_reject_terms = [
+        "ACTIONTYPE", "TIME ENTRY | EDIT", "TIME ENTRY DELETE", "FIELD | WAS"
+    ]
+    if sum(1 for term in report_reject_terms if term in txt_upper) >= 2:
+        return False
+        
+    # Positive validation: Must contain clear Edited Punch Request form indicators
+    form_accept_terms = [
+        "EDITED PUNCH REQUEST", "SOLICITUD DE HORAS", "HORAS EDITADAS",
+        "CORRECT HOURS WORKED", "PONCHAR ADENTRO", "FORGOT TO PUNCH",
+        "FORGOT TO CLOCK", "OLVIDE PONCHAR", "AJUSTADO MI TIEMPO",
+        "POS SYSTEM TO REFLECT", "PUNCH REQUEST", "PONCHAR AFUERA"
+    ]
+    
+    return any(term in txt_upper for term in form_accept_terms)
+
+
+def extract_text_with_ocr_split(pdf_bytes: bytes) -> list[tuple[int, str, str]]:
     """
     Converts PDF pages to images and splits each page into TOP and BOTTOM halves.
-    Returns tuples of (page_index, section_text) to bind sections to physical pages.
+    Returns tuples of (page_index, section_id, section_text).
     """
     if not pdf_bytes:
         return []
@@ -29,10 +62,12 @@ def extract_text_with_ocr_split(pdf_bytes: bytes) -> list[tuple[int, str]]:
         txt_top = pytesseract.image_to_string(top_half)
         txt_bottom = pytesseract.image_to_string(bottom_half)
 
-        if txt_top and len(txt_top.strip()) > 20:
-            page_sections.append((page_idx, txt_top))
-        if txt_bottom and len(txt_bottom.strip()) > 20:
-            page_sections.append((page_idx, txt_bottom))
+        # Process sections that pass form validation
+        if txt_top and len(txt_top.strip()) > 20 and is_valid_edited_punch_form(txt_top):
+            page_sections.append((page_idx, "top", txt_top))
+            
+        if txt_bottom and len(txt_bottom.strip()) > 20 and is_valid_edited_punch_form(txt_bottom):
+            page_sections.append((page_idx, "bottom", txt_bottom))
 
     return page_sections
 
@@ -122,7 +157,7 @@ def extract_time_from_datetime(datetime_val) -> str:
         return match.group(0) if match else val_str
 
 
-def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str]]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Audit engine matching OCR sections against CSV edit entries with physical page deduplication."""
     
     emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
@@ -158,7 +193,7 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str]]) -> tupl
     used_page_indices = set()
 
     # SECTION-FIRST MATCHING WITH PHYSICAL PAGE DEDUPLICATION
-    for page_idx, sec_text in ocr_sections:
+    for page_idx, sec_type, sec_text in ocr_sections:
         if page_idx in used_page_indices:
             continue
 
