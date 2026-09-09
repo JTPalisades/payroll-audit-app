@@ -1,4 +1,5 @@
 streamlit
 pandas
-pdfplumber
 python-docx
+pdf2image
+pytesseract
