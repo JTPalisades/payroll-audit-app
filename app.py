@@ -9,6 +9,8 @@ import pytesseract
 
 def extract_text_with_ocr(pdf_bytes: bytes) -> list[str]:
     """Converts scanned PDF pages into images and runs OCR to extract text from forms."""
+    if not pdf_bytes:
+        return []
     images = convert_from_bytes(pdf_bytes)
     page_texts = []
     for img in images:
@@ -29,13 +31,13 @@ def process_toast_csv(csv_files) -> pd.DataFrame:
     return df_all
 
 
-def get_date_variants(date_str) -> list[str]:
+def get_date_variants(date_val) -> list[str]:
     """Generates short date variants (e.g., '8/7', '08/07', '8/7/26') for matching."""
-    if pd.isna(date_str):
+    if pd.isna(date_val):
         return []
     
     try:
-        dt = pd.to_datetime(date_str)
+        dt = pd.to_datetime(date_val)
         m, d, y = dt.month, dt.day, str(dt.year)[-2:]
         return [
             f"{m}/{d}",
@@ -44,7 +46,7 @@ def get_date_variants(date_str) -> list[str]:
             f"{m:02d}/{d:02d}/{y}"
         ]
     except Exception:
-        return [str(date_str).strip()]
+        return [str(date_val).strip()]
 
 
 def get_name_tokens(name_str: str) -> list[str]:
@@ -57,17 +59,18 @@ def get_name_tokens(name_str: str) -> list[str]:
 
 
 def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Matches CSV edits against scanned PDF pages using token search."""
+    """Matches CSV edits against scanned PDF pages using robust token search."""
     
-    # Exact column matching to prevent picking 'Employee Id' over 'Employee'
+    # Exact column selection
     emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
     mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower()), df.columns[1])
     change_col = "Change" if "Change" in df.columns else next((c for c in df.columns if "change" in c.lower()), None)
     in_date_col = "In Date" if "In Date" in df.columns else next((c for c in df.columns if "date" in c.lower()), None)
+    time_edit_col = "Time" if "Time" in df.columns else None
 
     filtered = df.copy()
     
-    # Filter out CREATE entries
+    # Filter out CREATE entries (only evaluate modifications/deletions)
     if change_col and change_col in filtered.columns:
         filtered = filtered[filtered[change_col] != "CREATE"]
 
@@ -85,31 +88,43 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
     for _, row in filtered.iterrows():
         manager = str(row[mgr_col]).strip()
         employee = str(row[emp_col]).strip()
-        raw_date = row[in_date_col] if in_date_col else None
+        
+        shift_date_raw = row[in_date_col] if in_date_col else None
+        edit_time_raw = row[time_edit_col] if time_edit_col else None
 
         tokens = get_name_tokens(employee)
-        date_vars = get_date_variants(raw_date)
+        date_vars = get_date_variants(shift_date_raw) + get_date_variants(edit_time_raw)
 
         matched = False
+        
+        # Pass 1: Strict match (Name AND Date on same page)
         for page_text in ocr_pages:
-            # Match if at least one primary name token appears on page
             token_matches = [
                 t for t in tokens 
                 if re.search(r"\b" + re.escape(t[:4]) + r"[a-z]*\b", page_text, re.IGNORECASE)
             ]
             has_name = len(token_matches) >= 1 if tokens else False
-
-            # Match date if present
             has_date = any(d in page_text for d in date_vars) if date_vars else True
 
             if has_name and has_date:
                 matched = True
                 break
 
+        # Pass 2: Name-only fallback match if page is present
+        if not matched:
+            for page_text in ocr_pages:
+                token_matches = [
+                    t for t in tokens 
+                    if re.search(r"\b" + re.escape(t[:4]) + r"[a-z]*\b", page_text, re.IGNORECASE)
+                ]
+                if len(token_matches) >= 1:
+                    matched = True
+                    break
+
         details.append({
             "Manager": manager,
             "Employee": employee,
-            "Edit_Date": str(raw_date) if raw_date else "N/A",
+            "Edit_Date": str(shift_date_raw) if shift_date_raw else "N/A",
             "Has_Signed_Form": matched
         })
 
@@ -131,7 +146,7 @@ def analyze_edits(df: pd.DataFrame, ocr_pages: list[str]) -> tuple[pd.DataFrame,
 
 
 def create_word_docx(summary_df: pd.DataFrame, details_df: pd.DataFrame) -> io.BytesIO:
-    """Generates the downloadable Word audit summary."""
+    """Generates downloadable Word audit summary."""
     doc = Document()
     doc.add_heading("Toast POS Time Edit Audit Report", level=1)
 
@@ -189,7 +204,9 @@ if st.button("Process & Generate Audit", type="primary"):
         with st.spinner("Processing OCR on scanned PDFs and running audit..."):
             all_ocr_pages = []
             for pdf_file in pdf_files:
-                pages = extract_text_with_ocr(pdf_file.read())
+                # Use .getvalue() to prevent empty buffer reads in Streamlit
+                pdf_bytes = pdf_file.getvalue()
+                pages = extract_text_with_ocr(pdf_bytes)
                 all_ocr_pages.extend(pages)
 
             csv_df = process_toast_csv(csv_files)
