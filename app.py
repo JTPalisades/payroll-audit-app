@@ -41,7 +41,6 @@ def build_styled_docx(csv_df, pdf_text):
     STEEL_BLUE = "5C768D"
     LIGHT_BG = "F0F4F8"
     BORDER_GREY = "D3D3D3"
-    TEXT_DARK = "333333"
 
     def set_cell_background(cell, hex_color):
         shd = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{hex_color}"/>')
@@ -82,24 +81,29 @@ def build_styled_docx(csv_df, pdf_text):
         r.font.color.rgb = RGBColor(0x1B, 0x36, 0x5D)
         return h
 
-    def format_table(table, header_data, rows_data):
+    def create_and_format_table(header_data, rows_data):
+        num_rows = len(rows_data) + 1
+        num_cols = len(header_data)
+        
+        table = doc.add_table(rows=num_rows, cols=num_cols)
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
         set_table_borders(table)
 
         # Build Header Row
         for i, header_text in enumerate(header_data):
             cell = table.cell(0, i)
-            cell.text = header_text
+            cell.text = str(header_text)
             set_cell_background(cell, NAVY)
             set_cell_margins(cell, top=100, bottom=100, left=120, right=120)
             p = cell.paragraphs[0]
             if i > 0:
                 p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            run = p.runs[0]
-            run.font.name = "Calibri"
-            run.font.size = Pt(9.5)
-            run.font.bold = True
-            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+            if p.runs:
+                run = p.runs[0]
+                run.font.name = "Calibri"
+                run.font.size = Pt(9.5)
+                run.font.bold = True
+                run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
 
         # Build Data Rows
         for r_idx, row in enumerate(rows_data):
@@ -108,21 +112,24 @@ def build_styled_docx(csv_df, pdf_text):
                 cell.text = str(val)
                 set_cell_margins(cell, top=80, bottom=80, left=120, right=120)
                 p = cell.paragraphs[0]
-                if c_idx > 0 and not any(char.isalpha() for char in str(val).replace("->", "").replace("PM", "").replace("AM", "").strip()):
+                
+                # Right-align numeric columns
+                str_val = str(val).strip()
+                if c_idx > 0 and not any(char.isalpha() for char in str_val.replace("->", "").replace("PM", "").replace("AM", "")):
                     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
-                run = p.runs[0]
-                run.font.name = "Calibri"
-                run.font.size = Pt(9)
+                if p.runs:
+                    run = p.runs[0]
+                    run.font.name = "Calibri"
+                    run.font.size = Pt(9)
 
-                if r_idx % 2 == 1:
-                    set_cell_background(cell, LIGHT_BG)
+                    if r_idx % 2 == 1:
+                        set_cell_background(cell, LIGHT_BG)
 
-                # Bold Totals Row if present
-                if "TOTAL" in str(row[0]).upper() or "COMBINED" in str(row[0]).upper():
-                    run.font.bold = True
-                    if c_idx == len(row) - 1:
-                        run.font.color.rgb = RGBColor(0xA6, 0x1C, 0x1C)
+                    if "TOTAL" in str(row[0]).upper() or "COMBINED" in str(row[0]).upper():
+                        run.font.bold = True
+                        if c_idx == len(row) - 1:
+                            run.font.color.rgb = RGBColor(0xA6, 0x1C, 0x1C)
 
     # -------------------------------------------------------------
     # DOCUMENT HEADER
@@ -168,7 +175,7 @@ def build_styled_docx(csv_df, pdf_text):
     # -------------------------------------------------------------
     # SECTION 1: EXECUTIVE SUMMARY
     # -------------------------------------------------------------
-    add_section_header("1. Executive Summary & Year-to-Date Audit Findings")
+    add_section_header("1. Executive Summary & Audit Overview")
     
     p_exec = doc.add_paragraph(
         "A comprehensive wage and hour compliance audit was conducted across the provided pay periods. "
@@ -179,7 +186,6 @@ def build_styled_docx(csv_df, pdf_text):
     p_exec.style.font.name = "Calibri"
     p_exec.style.font.size = Pt(10.5)
 
-    # Section 1 Table Data (Summary Overview)
     headers_s1 = ["Pay Period Ending (PPE)", "Total System Edits", "Forms Verified", "Forms Missing", "Compliance Rate"]
     rows_s1 = [
         ["PPE 01/20/2026", "23", "12", "11", "52.2%"],
@@ -187,13 +193,12 @@ def build_styled_docx(csv_df, pdf_text):
         ["PPE 02/17/2026", "26", "14", "12", "53.8%"],
         ["COMBINED YTD TOTALS", "77", "42", "35", "54.5%"]
     ]
-    tbl_s1 = doc.add_table(rows=len(rows_s1) + 1, cols=len(headers_s1))
-    format_table(tbl_s1, headers_s1, rows_s1)
+    create_and_format_table(headers_s1, rows_s1)
 
     # -------------------------------------------------------------
     # SECTION 2: MANAGER BREAKDOWN
     # -------------------------------------------------------------
-    add_section_header("2. Manager Attribution & Year-to-Date Compliance Performance")
+    add_section_header("2. Manager Attribution & Compliance Performance")
     
     p_mgr = doc.add_paragraph("The table below attributes system timecard edits executed during the audit period to the specific editing manager logged in the POS audit system:")
     p_mgr.style.font.name = "Calibri"
@@ -205,29 +210,27 @@ def build_styled_docx(csv_df, pdf_text):
         ["Anthony Luerra", "30", "12", "18", "40.0%"],
         ["Donny Berger", "22", "12", "10", "54.5%"]
     ]
-    tbl_s2 = doc.add_table(rows=len(rows_s2) + 1, cols=len(headers_s2))
-    format_table(tbl_s2, headers_s2, rows_s2)
+    create_and_format_table(headers_s2, rows_s2)
 
     # -------------------------------------------------------------
     # SECTION 3: DETAILED FINDINGS BY PAY PERIOD
     # -------------------------------------------------------------
     add_section_header("3. Detailed Findings by Pay Period (Itemized Data)")
 
-    # Example Itemized Table from CSV
     p_period = doc.add_paragraph()
     p_period.paragraph_format.space_before = Pt(8)
     p_period.paragraph_format.space_after = Pt(4)
-    r_period = p_period.add_run("Pay Period Ending: 01/20/2026")
+    r_period = p_period.add_run("Itemized System Edits Log")
     r_period.font.name = "Arial"
     r_period.font.size = Pt(11)
     r_period.font.bold = True
     r_period.font.color.rgb = RGBColor(0x5C, 0x76, 0x8D)
 
+    # Dynamically extract first 6 columns from CSV
     cols_to_display = csv_df.columns[:6].tolist()
-    csv_rows = csv_df.head(10).fillna("N/A").values.tolist()
+    csv_rows = csv_df[cols_to_display].head(15).fillna("N/A").values.tolist()
 
-    tbl_s3 = doc.add_table(rows=len(csv_rows) + 1, cols=len(cols_to_display))
-    format_table(tbl_s3, cols_to_display, csv_rows)
+    create_and_format_table(cols_to_display, csv_rows)
 
     # -------------------------------------------------------------
     # SECTION 4: RISK ANALYSIS & ACTION PLAN
@@ -254,7 +257,6 @@ def build_styled_docx(csv_df, pdf_text):
         r_rdesc.font.name = "Calibri"
         r_rdesc.font.size = Pt(10.5)
 
-    # Save to buffer
     buffer = io.BytesIO()
     doc.save(buffer)
     buffer.seek(0)
