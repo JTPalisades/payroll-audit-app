@@ -8,54 +8,57 @@ from pdf2image import convert_from_bytes
 import pytesseract
 
 
-def is_valid_punch_request_page(ocr_text: str) -> bool:
+def is_not_cover_or_report(ocr_text: str) -> bool:
     """
-    Validates if an OCR text section is a genuine Edited Punch Request form.
-    Rejects paycheck sign-off rosters, cover sheets, and printed Toast POS audit reports.
+    Location-agnostic filter: Rejects paycheck rosters, cover sheets, 
+    and embedded Toast POS audit log tables while accepting all edit form pages.
     """
     txt_upper = ocr_text.upper()
     
-    # 1. Exclude Rosters and Cover sheets
-    roster_reject_terms = [
-        "PAYCHECK SIGNATURES", "PAYROLL SIGNATURES", "FOH PAYCHECK", "BOH PAYCHECK",
-        "CONFIRMATION AND ACKNOWLEDGEMENT OF", "PROPERTIES NAME:", "REST AND MEAL BREAK CONFIRMATION"
+    # 1. Reject Payroll / Paycheck Sign-off Rosters
+    roster_terms = [
+        "PAYCHECK SIGNATURES", "PAYROLL SIGNATURES", "FOH PAYCHECK", "BOH PAYCHECK"
     ]
-    if any(term in txt_upper for term in roster_reject_terms):
+    if any(term in txt_upper for term in roster_terms):
         return False
         
-    # 2. Exclude printed Toast POS CSV/report pages (containing tabular audit logs)
-    report_reject_terms = [
-        "ACTIONTYPE", "TIME ENTRY | EDIT", "TIME ENTRY DELETE", "FIELD | WAS"
+    # 2. Reject Cover / Policy Confirmation Sheets
+    cover_terms = [
+        "CONFIRMATION AND ACKNOWLEDGEMENT", "PAY PERIOD ENDING:", "APPROPRIATE PAYMENT FOR HOURS WORKED"
     ]
-    if sum(1 for term in report_reject_terms if term in txt_upper) >= 2:
+    if any(term in txt_upper for term in cover_terms):
         return False
-
-    # 3. Header / Form Content Check
-    form_terms = [
-        "EDITED PUNCH REQUEST", "SOLICITUD DE HORAS", "HORAS EDITADAS", "PUNCH REQUEST",
-        "CLOCK IN", "PONCHAR", "CORRECT HOURS", "AJUSTADO MI TIEMPO", "POS SYSTEM"
-    ]
-    
-    return any(kw in txt_upper for kw in form_terms)
+        
+    # 3. Reject Printed Toast POS Audit Log Tables
+    if ("TIMEIN" in txt_upper and "TIMEOUT" in txt_upper and "EMPLOYEE" in txt_upper) or ("ACTIONTYPE" in txt_upper and "FIELD" in txt_upper):
+        return False
+        
+    return True
 
 
-def extract_text_with_ocr_smart(pdf_bytes: bytes) -> list[tuple[int, str, str]]:
+def extract_text_with_ocr_smart(pdf_bytes: bytes) -> tuple[list[tuple[int, str, str]], int]:
     """
     Runs OCR on full intact pages and overlapping top/bottom halves (16% overlap).
     Guarantees form text near page midpoints is never cut in half.
     """
     if not pdf_bytes:
-        return []
+        return [], 0
     
-    images = convert_from_bytes(pdf_bytes)
+    try:
+        images = convert_from_bytes(pdf_bytes)
+    except Exception as e:
+        st.error(f"PDF Image Rendering Error: {e}. Verify poppler-utils is installed in packages.txt.")
+        return [], 0
+
     page_sections = []
+    total_pages = len(images)
 
     for page_idx, img in enumerate(images):
         width, height = img.size
         
         # 1. Full page intact text
         txt_full = pytesseract.image_to_string(img)
-        if txt_full and len(txt_full.strip()) > 30 and is_valid_punch_request_page(txt_full):
+        if txt_full and len(txt_full.strip()) > 30 and is_not_cover_or_report(txt_full):
             page_sections.append((page_idx, "full", txt_full))
         
         # 2. Overlapping Top and Bottom halves (Top: 0-58%, Bottom: 42-100%)
@@ -65,35 +68,44 @@ def extract_text_with_ocr_smart(pdf_bytes: bytes) -> list[tuple[int, str, str]]:
         txt_top = pytesseract.image_to_string(top_half)
         txt_bottom = pytesseract.image_to_string(bottom_half)
 
-        if txt_top and len(txt_top.strip()) > 20 and is_valid_punch_request_page(txt_top):
+        if txt_top and len(txt_top.strip()) > 20 and is_not_cover_or_report(txt_top):
             page_sections.append((page_idx, "top", txt_top))
             
-        if txt_bottom and len(txt_bottom.strip()) > 20 and is_valid_punch_request_page(txt_bottom):
+        if txt_bottom and len(txt_bottom.strip()) > 20 and is_not_cover_or_report(txt_bottom):
             page_sections.append((page_idx, "bottom", txt_bottom))
 
-    return page_sections
+    return page_sections, total_pages
 
 
 def process_toast_csv(csv_files) -> tuple[pd.DataFrame, str, str, str]:
-    """Combines Toast POS CSV files, extracts store location name, and determines audit date range."""
+    """Location-agnostic CSV cleaning and column auto-detection."""
     dfs = []
     for csv_file in csv_files:
-        df = pd.read_csv(csv_file)
-        dfs.append(df)
+        try:
+            df = pd.read_csv(csv_file)
+            dfs.append(df)
+        except Exception as e:
+            st.warning(f"Could not parse CSV file {csv_file.name}: {e}")
+
+    if not dfs:
+        return pd.DataFrame(), "Unknown_Location", "Audit_Report", "N/A"
 
     df_all = pd.concat(dfs, ignore_index=True)
     df_all.columns = df_all.columns.str.strip()
 
-    # Extract location name
-    loc_col = next((c for c in df_all.columns if "location" in c.lower() and "code" not in c.lower()), None)
+    # Dynamic Location Extraction
+    loc_col = next((c for c in df_all.columns if "location" in c.lower() and "code" not in c.lower() and "id" not in c.lower()), None)
     location_name = "Location"
     
     if loc_col and not df_all[loc_col].dropna().empty:
         raw_loc = str(df_all[loc_col].dropna().iloc[0]).strip()
         location_name = re.sub(r'[^\w\s-]', '', raw_loc).strip().replace(" ", "_")
+    elif csv_files:
+        clean_fname = re.sub(r'[^\w\s-]', '', csv_files[0].name.split('.')[0]).strip().replace(" ", "_")
+        location_name = clean_fname if clean_fname else "Location"
 
-    # Extract date range
-    in_date_col = "In Date" if "In Date" in df_all.columns else next((c for c in df_all.columns if "date" in c.lower()), None)
+    # Date Range Extraction
+    in_date_col = next((c for c in df_all.columns if "in date" in c.lower() or "clock in" in c.lower() or "shiftdate" in c.lower() or "date" in c.lower()), None)
     
     date_filename_str = "Audit_Report"
     date_display_str = "N/A"
@@ -188,21 +200,31 @@ def extract_time_from_datetime(datetime_val) -> str:
 
 def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Universal audit engine matching PDF form sections against CSV shift edits."""
-    
-    emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
-    mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower() or "by" in c.lower()), df.columns[1])
-    change_col = "Change" if "Change" in df.columns else next((c for c in df.columns if "change" in c.lower() or "action" in c.lower()), None)
-    in_date_col = "In Date" if "In Date" in df.columns else next((c for c in df.columns if "date" in c.lower() or "time" in c.lower()), None)
-    out_date_col = "Out Date" if "Out Date" in df.columns else None
-    job_title_col = "Job Title" if "Job Title" in df.columns else next((c for c in df.columns if "job" in c.lower()), None)
-    time_edit_col = "Time" if "Time" in df.columns else None
+    if df.empty:
+        summary_df = pd.DataFrame(columns=["Manager", "Total_Edits", "Forms_Present", "Forms_Missing", "Compliance_Pct"])
+        return summary_df, pd.DataFrame()
+
+    # Dynamic Column Auto-Detection
+    emp_col = next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower() and "guid" not in c.lower() and "external" not in c.lower()), None)
+    if not emp_col:
+        emp_col = next((c for c in df.columns if "employee" in c.lower()), df.columns[0])
+
+    mgr_col = next((c for c in df.columns if "manager" in c.lower() or "edited by" in c.lower() or "user" in c.lower()), None)
+    if not mgr_col:
+        mgr_col = df.columns[1]
+
+    change_col = next((c for c in df.columns if "change" in c.lower() or "action" in c.lower() or "type" in c.lower()), None)
+    in_date_col = next((c for c in df.columns if "in date" in c.lower() or "clock in" in c.lower() or "shiftdate" in c.lower() or "date" in c.lower()), df.columns[0])
+    out_date_col = next((c for c in df.columns if "out date" in c.lower() or "clock out" in c.lower() or "timeout" in c.lower()), None)
+    job_title_col = next((c for c in df.columns if "job" in c.lower() and "id" not in c.lower() and "guid" not in c.lower() and "code" not in c.lower()), None)
+    time_edit_col = next((c for c in df.columns if "time" in c.lower() and "total" not in c.lower() and "break" not in c.lower() and "in" not in c.lower() and "out" not in c.lower()), None)
 
     # 1. Filter out missing managers
     filtered = df.dropna(subset=[mgr_col]).copy()
 
     # 2. Filter out CREATE actions
     if change_col and change_col in filtered.columns:
-        filtered = filtered[filtered[change_col] != "CREATE"]
+        filtered = filtered[filtered[change_col].astype(str).str.upper() != "CREATE"]
 
     # 3. Filter ghost employees
     has_digit_pattern = r"\d"
@@ -220,7 +242,7 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
     filtered["Has_Signed_Form"] = False
     used_csv_indices = set()
     used_sections = set()
-    page_matched_employees = {}  # Tracks page_idx -> set of employee names matched on that physical page
+    page_matched_employees = {}
 
     # MATCH EACH VALID PDF FORM SECTION TO A CSV SHIFT EDIT
     for page_idx, sec_type, sec_text in ocr_sections:
@@ -406,41 +428,64 @@ if st.button("Process & Generate Audit", type="primary"):
         st.error("Please upload both CSV and PDF files.")
     else:
         with st.spinner("Running page-by-page OCR and matching edits..."):
-            all_ocr_sections = []
-            for pdf_file in pdf_files:
-                pdf_bytes = pdf_file.getvalue()
-                sections = extract_text_with_ocr_smart(pdf_bytes)
-                all_ocr_sections.extend(sections)
+            try:
+                # 1. OCR Processing
+                all_ocr_sections = []
+                total_pdf_pages = 0
+                for pdf_file in pdf_files:
+                    pdf_bytes = pdf_file.getvalue()
+                    sections, page_count = extract_text_with_ocr_smart(pdf_bytes)
+                    all_ocr_sections.extend(sections)
+                    total_pdf_pages += page_count
 
-            csv_df, location_name, date_filename_str, date_display_str = process_toast_csv(csv_files)
-            summary_df, details_df = analyze_edits(csv_df, all_ocr_sections)
+                # 2. CSV Processing & Location Auto-Detection
+                csv_df, location_name, date_filename_str, date_display_str = process_toast_csv(csv_files)
 
-            st.success("Audit complete!")
+                # 3. Perform Matching & Audit Analysis
+                summary_df, details_df = analyze_edits(csv_df, all_ocr_sections)
 
-            total_edits = summary_df["Total_Edits"].sum() if not summary_df.empty else 0
-            total_forms = summary_df["Forms_Present"].sum() if not summary_df.empty else 0
-            overall_pct = round((total_forms / total_edits) * 100, 1) if total_edits > 0 else 0
+                st.success("Audit complete!")
 
-            # Display metrics in UI
-            st.markdown(f"### Audit for **{location_name.replace('_', ' ')}** ({date_display_str})")
-            
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Total Manager Shift Edits", total_edits)
-            m2.metric("Signed Forms Found", total_forms)
-            m3.metric("Overall Compliance", f"{overall_pct}%")
+                total_edits = summary_df["Total_Edits"].sum() if not summary_df.empty else 0
+                total_forms = summary_df["Forms_Present"].sum() if not summary_df.empty else 0
+                overall_pct = round((total_forms / total_edits) * 100, 1) if total_edits > 0 else 0
 
-            st.subheader("Manager Summary")
-            st.dataframe(summary_df, use_container_width=True)
+                # Display metrics in UI
+                st.markdown(f"### Audit for **{location_name.replace('_', ' ')}** ({date_display_str})")
+                
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total Manager Shift Edits", total_edits)
+                m2.metric("Signed Forms Found", total_forms)
+                m3.metric("Overall Compliance", f"{overall_pct}%")
 
-            st.subheader("Audit Detail Report")
-            st.dataframe(details_df, use_container_width=True)
+                # Diagnostic Status Expander
+                with st.expander("🔍 Interactive Processing Diagnostics", expanded=False):
+                    st.write(f"**Location Extracted:** {location_name.replace('_', ' ')}")
+                    st.write(f"**Date Range Extracted:** {date_display_str}")
+                    st.write(f"**PDF Pages Uploaded:** {total_pdf_pages}")
+                    st.write(f"**Valid Form Sections Recognized:** {len(all_ocr_sections)}")
+                    st.write(f"**Total CSV Records Loaded:** {len(csv_df)}")
 
-            docx_buf = create_word_docx(summary_df, details_df, location_name, date_display_str)
-            report_filename = f"{location_name}_Audit_{date_filename_str}.docx"
+                if total_forms == 0 and total_edits > 0:
+                    st.warning("⚠️ 0 signed forms were matched. Please verify that the PDF contains valid form sheets and that scans are oriented right-side up.")
 
-            st.download_button(
-                label=f"📥 Download {location_name} Audit Report (.docx)",
-                data=docx_buf,
-                file_name=report_filename,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
+                st.subheader("Manager Summary")
+                st.dataframe(summary_df, use_container_width=True)
+
+                st.subheader("Audit Detail Report")
+                st.dataframe(details_df, use_container_width=True)
+
+                if not summary_df.empty:
+                    docx_buf = create_word_docx(summary_df, details_df, location_name, date_display_str)
+                    report_filename = f"{location_name}_Audit_{date_filename_str}.docx"
+
+                    st.download_button(
+                        label=f"📥 Download {location_name.replace('_', ' ')} Audit Report (.docx)",
+                        data=docx_buf,
+                        file_name=report_filename,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
+
+            except Exception as main_err:
+                st.error(f"An unexpected error occurred during processing: {main_err}")
+                st.info("Please verify that your uploaded files match the standard Toast POS export format.")
