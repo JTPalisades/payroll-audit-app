@@ -8,14 +8,14 @@ from pdf2image import convert_from_bytes
 import pytesseract
 
 
-def is_truly_signed_acknowledgement_form(ocr_text: str) -> bool:
+def is_valid_punch_request_page(ocr_text: str) -> bool:
     """
-    Strictly verifies if an OCR section is a genuine filled Edited Punch Request form sheet.
-    Rejects rosters, cover sheets, and printed Toast POS audit reports.
+    Validates if an OCR text section is a genuine Edited Punch Request form.
+    Rejects paycheck sign-off rosters, cover sheets, and printed Toast POS audit reports.
     """
     txt_upper = ocr_text.upper()
     
-    # Exclude Rosters and Cover sheets
+    # 1. Exclude Rosters and Cover sheets
     roster_reject_terms = [
         "PAYCHECK SIGNATURES", "PAYROLL SIGNATURES", "FOH PAYCHECK", "BOH PAYCHECK",
         "CONFIRMATION AND ACKNOWLEDGEMENT OF", "PROPERTIES NAME:", "REST AND MEAL BREAK CONFIRMATION"
@@ -23,32 +23,26 @@ def is_truly_signed_acknowledgement_form(ocr_text: str) -> bool:
     if any(term in txt_upper for term in roster_reject_terms):
         return False
         
-    # Exclude printed Toast POS CSV/report pages (containing tabular audit logs)
+    # 2. Exclude printed Toast POS CSV/report pages (containing tabular audit logs)
     report_reject_terms = [
         "ACTIONTYPE", "TIME ENTRY | EDIT", "TIME ENTRY DELETE", "FIELD | WAS"
     ]
     if sum(1 for term in report_reject_terms if term in txt_upper) >= 2:
         return False
 
-    # Header check
-    has_header = any(
-        kw in txt_upper 
-        for kw in ["EDITED PUNCH REQUEST", "SOLICITUD DE HORAS", "HORAS EDITADAS", "PUNCH REQUEST"]
-    )
+    # 3. Header / Form Content Check
+    form_terms = [
+        "EDITED PUNCH REQUEST", "SOLICITUD DE HORAS", "HORAS EDITADAS", "PUNCH REQUEST",
+        "CLOCK IN", "PONCHAR", "CORRECT HOURS", "AJUSTADO MI TIEMPO", "POS SYSTEM"
+    ]
     
-    # Manager / Signature completion field check
-    has_signature_field = any(
-        kw in txt_upper 
-        for kw in ["COMPLETED BY MANAGER", "MANAGER SIGNATURE", "FIRMA", "SIGNATURE", "COMPLETED BY"]
-    )
-
-    return has_header and has_signature_field
+    return any(kw in txt_upper for kw in form_terms)
 
 
 def extract_text_with_ocr_smart(pdf_bytes: bytes) -> list[tuple[int, str, str]]:
     """
     Runs OCR on full intact pages and overlapping top/bottom halves (16% overlap).
-    Guarantees no signature lines or headers near the middle of a page are cut in half.
+    Guarantees form text near page midpoints is never cut in half.
     """
     if not pdf_bytes:
         return []
@@ -61,7 +55,7 @@ def extract_text_with_ocr_smart(pdf_bytes: bytes) -> list[tuple[int, str, str]]:
         
         # 1. Full page intact text
         txt_full = pytesseract.image_to_string(img)
-        if txt_full and len(txt_full.strip()) > 30 and is_truly_signed_acknowledgement_form(txt_full):
+        if txt_full and len(txt_full.strip()) > 30 and is_valid_punch_request_page(txt_full):
             page_sections.append((page_idx, "full", txt_full))
         
         # 2. Overlapping Top and Bottom halves (Top: 0-58%, Bottom: 42-100%)
@@ -71,10 +65,10 @@ def extract_text_with_ocr_smart(pdf_bytes: bytes) -> list[tuple[int, str, str]]:
         txt_top = pytesseract.image_to_string(top_half)
         txt_bottom = pytesseract.image_to_string(bottom_half)
 
-        if txt_top and len(txt_top.strip()) > 20 and is_truly_signed_acknowledgement_form(txt_top):
+        if txt_top and len(txt_top.strip()) > 20 and is_valid_punch_request_page(txt_top):
             page_sections.append((page_idx, "top", txt_top))
             
-        if txt_bottom and len(txt_bottom.strip()) > 20 and is_truly_signed_acknowledgement_form(txt_bottom):
+        if txt_bottom and len(txt_bottom.strip()) > 20 and is_valid_punch_request_page(txt_bottom):
             page_sections.append((page_idx, "bottom", txt_bottom))
 
     return page_sections
@@ -246,7 +240,7 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
                 continue
 
             tokens = get_name_tokens(employee)
-            date_vars = get_date_variants_universal(row[in_date_col]) + (get_date_variants_universal(row[time_edit_col]) if time_edit_col else [])
+            date_vars = get_date_variants_universal(row[in_date_col]) + (get_date_variants_universal(row[time_edit_col]) if time_edit_col and time_edit_col in row else [])
 
             has_emp = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", sec_text, re.IGNORECASE) for t in tokens) or fuzzy_match_tokens(tokens, sec_text)
             has_date = any(d in sec_text for d in date_vars) if date_vars else True
