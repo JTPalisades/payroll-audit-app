@@ -36,7 +36,7 @@ def is_truly_signed_acknowledgement_form(ocr_text: str) -> bool:
         for kw in ["EDITED PUNCH REQUEST", "SOLICITUD DE HORAS", "HORAS EDITADAS", "PUNCH REQUEST"]
     )
     
-    # Manager / Signature completion field check
+    # Signature / completion field check
     has_signature_field = any(
         kw in txt_upper 
         for kw in ["COMPLETED BY MANAGER", "MANAGER SIGNATURE", "FIRMA", "SIGNATURE", "COMPLETED BY"]
@@ -162,7 +162,7 @@ def extract_time_from_datetime(datetime_val) -> str:
 
 
 def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Audit engine with individual row-level binding and manager name verification."""
+    """Universal audit engine matching PDF form sections against CSV shift edits."""
     
     emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
     mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower() or "by" in c.lower()), df.columns[1])
@@ -190,58 +190,55 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
         ~filtered[mgr_col].astype(str).str.lower().str.contains(system_pattern, na=False)
     ].copy()
 
+    # Group CSV entries into unique Shift Edits
+    filtered["Shift_Date_Clean"] = pd.to_datetime(filtered[in_date_col], format="mixed", errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    
     filtered["Has_Signed_Form"] = False
     used_csv_indices = set()
-    used_page_indices = set()
+    used_sections = set()
 
-    # SECTION-FIRST MATCHING WITH ROW-LEVEL MANAGER VERIFICATION
-    for page_idx, sec_type, sec_text in ocr_sections:
-        if page_idx in used_page_indices:
+    # MATCH EACH VALID PDF FORM SECTION TO A CSV SHIFT EDIT
+    for sec_idx, sec_type, sec_text in ocr_sections:
+        sec_key = (sec_idx, sec_type)
+        if sec_key in used_sections:
             continue
 
         best_match_idx = None
 
-        # Pass 1: Name, Date AND Manager match
+        # Pass 1: Strict Employee Name AND Shift Date Match
         for idx, row in filtered.iterrows():
             if idx in used_csv_indices:
                 continue
 
             employee = str(row[emp_col]).strip()
-            manager = str(row[mgr_col]).strip()
-            emp_tokens = get_name_tokens(employee)
-            mgr_tokens = get_name_tokens(manager)
-
+            tokens = get_name_tokens(employee)
             date_vars = get_date_variants(row[in_date_col]) + (get_date_variants(row[time_edit_col]) if time_edit_col else [])
 
-            has_emp = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", sec_text, re.IGNORECASE) for t in emp_tokens) or fuzzy_match_tokens(emp_tokens, sec_text)
-            has_mgr = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", sec_text, re.IGNORECASE) for t in mgr_tokens) or fuzzy_match_tokens(mgr_tokens, sec_text)
+            has_emp = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", sec_text, re.IGNORECASE) for t in tokens) or fuzzy_match_tokens(tokens, sec_text)
             has_date = any(d in sec_text for d in date_vars) if date_vars else True
 
-            if has_emp and has_mgr and has_date:
+            if has_emp and has_date:
                 best_match_idx = idx
                 break
 
-        # Pass 2: Name AND Date match (Fallback if Manager name is omitted on paper)
+        # Pass 2: Fallback Employee Name Match
         if best_match_idx is None:
             for idx, row in filtered.iterrows():
                 if idx in used_csv_indices:
                     continue
 
                 employee = str(row[emp_col]).strip()
-                emp_tokens = get_name_tokens(employee)
-                date_vars = get_date_variants(row[in_date_col]) + (get_date_variants(row[time_edit_col]) if time_edit_col else [])
+                tokens = get_name_tokens(employee)
+                has_emp = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", sec_text, re.IGNORECASE) for t in tokens) or fuzzy_match_tokens(tokens, sec_text)
 
-                has_emp = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", sec_text, re.IGNORECASE) for t in emp_tokens) or fuzzy_match_tokens(emp_tokens, sec_text)
-                has_date = any(d in sec_text for d in date_vars) if date_vars else True
-
-                if has_emp and has_date:
+                if has_emp:
                     best_match_idx = idx
                     break
 
         if best_match_idx is not None:
             filtered.loc[best_match_idx, "Has_Signed_Form"] = True
             used_csv_indices.add(best_match_idx)
-            used_page_indices.add(page_idx)
+            used_sections.add(sec_key)
 
     # Build detailed records
     details_list = []
@@ -275,8 +272,11 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
         summary_df = pd.DataFrame(columns=["Manager", "Total_Edits", "Forms_Present", "Forms_Missing", "Compliance_Pct"])
         return summary_df, details_df
 
-    # Summarize manager edit actions
-    summary_df = details_df.groupby("Manager").agg(
+    # Deduplicate multiple Toast audit log rows belonging to the same shift
+    unique_shifts_df = details_df.drop_duplicates(subset=["Employee", "Shift_Date", "Manager"])
+
+    # Summarize shift edits per manager
+    summary_df = unique_shifts_df.groupby("Manager").agg(
         Total_Edits=("Has_Signed_Form", "count"),
         Forms_Present=("Has_Signed_Form", "sum")
     ).reset_index()
@@ -306,7 +306,7 @@ def create_word_docx(summary_df: pd.DataFrame, details_df: pd.DataFrame, locatio
     p.add_run(f"{clean_loc}\n")
     p.add_run("Date Range: ").bold = True
     p.add_run(f"{date_display_str}\n")
-    p.add_run("Total Manager Edits: ").bold = True
+    p.add_run("Total Manager Shift Edits: ").bold = True
     p.add_run(f"{total_edits}\n")
     p.add_run("Signed Forms Found: ").bold = True
     p.add_run(f"{total_forms}\n")
@@ -389,7 +389,7 @@ if st.button("Process & Generate Audit", type="primary"):
             st.markdown(f"### Audit for **{location_name.replace('_', ' ')}** ({date_display_str})")
             
             m1, m2, m3 = st.columns(3)
-            m1.metric("Total Manager Edits", total_edits)
+            m1.metric("Total Manager Shift Edits", total_edits)
             m2.metric("Signed Forms Found", total_forms)
             m3.metric("Overall Compliance", f"{overall_pct}%")
 
