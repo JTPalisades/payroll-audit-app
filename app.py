@@ -38,8 +38,9 @@ def is_not_cover_or_report(ocr_text: str) -> bool:
 
 def extract_text_with_ocr_smart(pdf_bytes: bytes) -> tuple[list[tuple[int, str, str]], int]:
     """
-    Converts PDF pages to images. Splits pages into Top (0-52%) and Bottom (48-100%) halves
-    to capture dual-form sheets (Laguna Beach layout) and single-form sheets (Danville layout).
+    Extracts text sections from PDF pages.
+    For dual-form sheets (separated by 'SOLICITUD DE HORAS EDITADAS'), splits into Top/Bottom.
+    Otherwise, extracts full intact page text.
     """
     if not pdf_bytes:
         return [], 0
@@ -54,21 +55,24 @@ def extract_text_with_ocr_smart(pdf_bytes: bytes) -> tuple[list[tuple[int, str, 
     total_pages = len(images)
 
     for page_idx, img in enumerate(images):
-        width, height = img.size
-        
-        # Crop Top and Bottom halves of page
-        top_half = img.crop((0, 0, width, int(height * 0.52)))
-        bottom_half = img.crop((0, int(height * 0.48), width, height))
+        txt_full = pytesseract.image_to_string(img)
+        if txt_full and len(txt_full.strip()) > 30 and is_not_cover_or_report(txt_full):
+            if "SOLICITUD DE HORAS EDITADAS" in txt_full.upper():
+                # Dual-form page split
+                width, height = img.size
+                top_half = img.crop((0, 0, width, int(height * 0.55)))
+                bottom_half = img.crop((0, int(height * 0.45), width, height))
 
-        txt_top = pytesseract.image_to_string(top_half)
-        txt_bottom = pytesseract.image_to_string(bottom_half)
+                txt_top = pytesseract.image_to_string(top_half)
+                txt_bottom = pytesseract.image_to_string(bottom_half)
 
-        # Include sections passing location-agnostic validation
-        if txt_top and len(txt_top.strip()) > 20 and is_not_cover_or_report(txt_top):
-            page_sections.append((page_idx, "top", txt_top))
-            
-        if txt_bottom and len(txt_bottom.strip()) > 20 and is_not_cover_or_report(txt_bottom):
-            page_sections.append((page_idx, "bottom", txt_bottom))
+                if txt_top and len(txt_top.strip()) > 20:
+                    page_sections.append((page_idx, "top", txt_top))
+                if txt_bottom and len(txt_bottom.strip()) > 20:
+                    page_sections.append((page_idx, "bottom", txt_bottom))
+            else:
+                # Single-form page
+                page_sections.append((page_idx, "full", txt_full))
 
     return page_sections, total_pages
 
@@ -233,16 +237,16 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
         ~filtered[mgr_col].astype(str).str.lower().str.contains(system_pattern, na=False)
     ].copy()
 
-    filtered["Shift_Date_Clean"] = pd.to_datetime(filtered[in_date_col], format="mixed", errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
-    
-    # Consolidate CSV into unique Manager Shift Edits
-    shift_edits_df = filtered.drop_duplicates(subset=[emp_col, "Shift_Date_Clean", mgr_col]).copy()
-    shift_edits_df["Has_Signed_Form"] = False
+    filtered["Shift_Date_Clean"] = pd.to_datetime(filtered[in_date_col], format="mixed", errors="coerce").dt.strftime("%m/%d/%Y").fillna("")
 
-    used_csv_indices = set()
+    # Deduplicate CSV to Unique Manager Shift Edits
+    shift_master = filtered.drop_duplicates(subset=[emp_col, "Shift_Date_Clean", mgr_col]).copy().reset_index()
+    shift_master["Has_Signed_Form"] = False
+
+    used_shift_indices = set()
     used_sections = set()
 
-    # MATCH EACH VALID PDF FORM SECTION TO A UNIQUE SHIFT EDIT
+    # MATCH EACH PDF FORM SECTION TO A UNIQUE SHIFT EDIT
     for page_idx, sec_type, sec_text in ocr_sections:
         sec_key = (page_idx, sec_type)
         if sec_key in used_sections:
@@ -251,8 +255,8 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
         best_match_idx = None
 
         # Pass 1: Strict Employee Name AND Shift Date Match
-        for idx, row in shift_edits_df.iterrows():
-            if idx in used_csv_indices:
+        for idx, row in shift_master.iterrows():
+            if idx in used_shift_indices:
                 continue
 
             employee = str(row[emp_col]).strip()
@@ -268,8 +272,8 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
 
         # Pass 2: Fallback Employee Name Match
         if best_match_idx is None:
-            for idx, row in shift_edits_df.iterrows():
-                if idx in used_csv_indices:
+            for idx, row in shift_master.iterrows():
+                if idx in used_shift_indices:
                     continue
 
                 employee = str(row[emp_col]).strip()
@@ -281,13 +285,24 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
                     break
 
         if best_match_idx is not None:
-            shift_edits_df.loc[best_match_idx, "Has_Signed_Form"] = True
-            used_csv_indices.add(best_match_idx)
+            shift_master.loc[best_match_idx, "Has_Signed_Form"] = True
+            used_shift_indices.add(best_match_idx)
             used_sections.add(sec_key)
+
+    # Map Has_Signed_Form back to all filtered rows
+    signed_shifts_set = set(
+        shift_master[shift_master["Has_Signed_Form"]][
+            [emp_col, "Shift_Date_Clean", mgr_col]
+        ].itertuples(index=False, name=None)
+    )
+
+    filtered["Has_Signed_Form"] = filtered[
+        [emp_col, "Shift_Date_Clean", mgr_col]
+    ].apply(lambda r: tuple(r) in signed_shifts_set, axis=1)
 
     # Build detailed records
     details_list = []
-    for _, row in shift_edits_df.iterrows():
+    for _, row in filtered.iterrows():
         job_title = str(row[job_title_col]) if job_title_col and not pd.isna(row[job_title_col]) else ""
         is_break = "Yes" if "break" in job_title.lower() else "No"
 
@@ -317,8 +332,10 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
         summary_df = pd.DataFrame(columns=["Manager", "Total_Edits", "Forms_Present", "Forms_Missing", "Compliance_Pct"])
         return summary_df, details_df
 
-    # Summarize shift edits per manager
-    summary_df = details_df.groupby("Manager").agg(
+    # Manager Summary based on Unique Shift Edits
+    unique_shifts_df = details_df.drop_duplicates(subset=["Employee", "Shift_Date", "Manager"])
+
+    summary_df = unique_shifts_df.groupby("Manager").agg(
         Total_Edits=("Has_Signed_Form", "count"),
         Forms_Present=("Has_Signed_Form", "sum")
     ).reset_index()
