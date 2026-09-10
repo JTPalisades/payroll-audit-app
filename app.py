@@ -36,7 +36,7 @@ def is_truly_signed_acknowledgement_form(ocr_text: str) -> bool:
         for kw in ["EDITED PUNCH REQUEST", "SOLICITUD DE HORAS", "HORAS EDITADAS", "PUNCH REQUEST"]
     )
     
-    # Signature / completion field check
+    # Manager / Signature completion field check
     has_signature_field = any(
         kw in txt_upper 
         for kw in ["COMPLETED BY MANAGER", "MANAGER SIGNATURE", "FIRMA", "SIGNATURE", "COMPLETED BY"]
@@ -45,10 +45,10 @@ def is_truly_signed_acknowledgement_form(ocr_text: str) -> bool:
     return has_header and has_signature_field
 
 
-def extract_text_with_ocr_split(pdf_bytes: bytes) -> list[tuple[int, str, str]]:
+def extract_text_with_ocr_smart(pdf_bytes: bytes) -> list[tuple[int, str, str]]:
     """
-    Converts PDF pages to images and splits each page into TOP and BOTTOM halves.
-    Returns tuples of (page_index, section_type, section_text).
+    Runs OCR on full intact pages and overlapping top/bottom halves (16% overlap).
+    Guarantees no signature lines or headers near the middle of a page are cut in half.
     """
     if not pdf_bytes:
         return []
@@ -59,14 +59,18 @@ def extract_text_with_ocr_split(pdf_bytes: bytes) -> list[tuple[int, str, str]]:
     for page_idx, img in enumerate(images):
         width, height = img.size
         
-        # Crop Top and Bottom halves of page
-        top_half = img.crop((0, 0, width, int(height * 0.52)))
-        bottom_half = img.crop((0, int(height * 0.48), width, height))
+        # 1. Full page intact text
+        txt_full = pytesseract.image_to_string(img)
+        if txt_full and len(txt_full.strip()) > 30 and is_truly_signed_acknowledgement_form(txt_full):
+            page_sections.append((page_idx, "full", txt_full))
+        
+        # 2. Overlapping Top and Bottom halves (Top: 0-58%, Bottom: 42-100%)
+        top_half = img.crop((0, 0, width, int(height * 0.58)))
+        bottom_half = img.crop((0, int(height * 0.42), width, height))
 
         txt_top = pytesseract.image_to_string(top_half)
         txt_bottom = pytesseract.image_to_string(bottom_half)
 
-        # Include sections passing strict validation
         if txt_top and len(txt_top.strip()) > 20 and is_truly_signed_acknowledgement_form(txt_top):
             page_sections.append((page_idx, "top", txt_top))
             
@@ -110,22 +114,49 @@ def process_toast_csv(csv_files) -> tuple[pd.DataFrame, str, str, str]:
     return df_all, location_name, date_filename_str, date_display_str
 
 
-def get_date_variants(date_val) -> list[str]:
-    """Generates date variants supporting slashes, hyphens, and dot/period separators."""
+def get_date_variants_universal(date_val) -> list[str]:
+    """Generates slash, dot, hyphen, and compact digit date variants (e.g. 73026, 073026, 7.30.2026)."""
     if pd.isna(date_val):
         return []
     
+    variants = set()
     try:
         dt = pd.to_datetime(date_val)
         m, d, y = dt.month, dt.day, str(dt.year)[-2:]
-        return [
-            f"{m}/{d}", f"{m:02d}/{d:02d}", f"{m}/{d}/{y}", f"{m:02d}/{d:02d}/{y}",
-            f"{m}.{d}", f"{m:02d}.{d:02d}", f"{m}.{d}.{y}", f"{m:02d}.{d:02d}.{y}", f"{m}.{d}.{dt.year}",
-            f"{m}-{d}", f"{m:02d}-{d:02d}", f"{m}-{d}-{y}", f"{m:02d}-{d:02d}-{y}"
-        ]
+        full_y = dt.year
+        
+        # Standard Slashes
+        variants.add(f"{m}/{d}")
+        variants.add(f"{m:02d}/{d:02d}")
+        variants.add(f"{m}/{d}/{y}")
+        variants.add(f"{m:02d}/{d:02d}/{y}")
+        
+        # Dots/Periods
+        variants.add(f"{m}.{d}")
+        variants.add(f"{m:02d}.{d:02d}")
+        variants.add(f"{m}.{d}.{y}")
+        variants.add(f"{m:02d}.{d:02d}.{y}")
+        variants.add(f"{m}.{d}.{full_y}")
+        
+        # Hyphens
+        variants.add(f"{m}-{d}")
+        variants.add(f"{m:02d}-{d:02d}")
+        variants.add(f"{m}-{d}-{y}")
+        variants.add(f"{m:02d}-{d:02d}-{y}")
+        
+        # Compact digits (73026, 073026, 72626)
+        variants.add(f"{m}{d:02d}{y}")
+        variants.add(f"{m:02d}{d:02d}{y}")
+        variants.add(f"{m}{d}{y}")
+        
     except Exception:
         s = str(date_val).strip()
-        return [s, s.replace("/", "."), s.replace("/", "-")]
+        variants.add(s)
+        variants.add(s.replace("/", "."))
+        variants.add(s.replace("/", "-"))
+        variants.add(s.replace("/", ""))
+
+    return list(variants)
 
 
 def get_name_tokens(name_str: str) -> list[str]:
@@ -190,16 +221,16 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
         ~filtered[mgr_col].astype(str).str.lower().str.contains(system_pattern, na=False)
     ].copy()
 
-    # Group CSV entries into unique Shift Edits
     filtered["Shift_Date_Clean"] = pd.to_datetime(filtered[in_date_col], format="mixed", errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     
     filtered["Has_Signed_Form"] = False
     used_csv_indices = set()
     used_sections = set()
+    page_matched_employees = {}  # Tracks page_idx -> set of employee names matched on that physical page
 
     # MATCH EACH VALID PDF FORM SECTION TO A CSV SHIFT EDIT
-    for sec_idx, sec_type, sec_text in ocr_sections:
-        sec_key = (sec_idx, sec_type)
+    for page_idx, sec_type, sec_text in ocr_sections:
+        sec_key = (page_idx, sec_type)
         if sec_key in used_sections:
             continue
 
@@ -211,8 +242,11 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
                 continue
 
             employee = str(row[emp_col]).strip()
+            if page_idx in page_matched_employees and employee in page_matched_employees[page_idx] and sec_type == "full":
+                continue
+
             tokens = get_name_tokens(employee)
-            date_vars = get_date_variants(row[in_date_col]) + (get_date_variants(row[time_edit_col]) if time_edit_col else [])
+            date_vars = get_date_variants_universal(row[in_date_col]) + (get_date_variants_universal(row[time_edit_col]) if time_edit_col else [])
 
             has_emp = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", sec_text, re.IGNORECASE) for t in tokens) or fuzzy_match_tokens(tokens, sec_text)
             has_date = any(d in sec_text for d in date_vars) if date_vars else True
@@ -228,6 +262,9 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
                     continue
 
                 employee = str(row[emp_col]).strip()
+                if page_idx in page_matched_employees and employee in page_matched_employees[page_idx] and sec_type == "full":
+                    continue
+
                 tokens = get_name_tokens(employee)
                 has_emp = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", sec_text, re.IGNORECASE) for t in tokens) or fuzzy_match_tokens(tokens, sec_text)
 
@@ -239,6 +276,11 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
             filtered.loc[best_match_idx, "Has_Signed_Form"] = True
             used_csv_indices.add(best_match_idx)
             used_sections.add(sec_key)
+            
+            emp_matched = str(filtered.loc[best_match_idx, emp_col]).strip()
+            if page_idx not in page_matched_employees:
+                page_matched_employees[page_idx] = set()
+            page_matched_employees[page_idx].add(emp_matched)
 
     # Build detailed records
     details_list = []
@@ -373,7 +415,7 @@ if st.button("Process & Generate Audit", type="primary"):
             all_ocr_sections = []
             for pdf_file in pdf_files:
                 pdf_bytes = pdf_file.getvalue()
-                sections = extract_text_with_ocr_split(pdf_bytes)
+                sections = extract_text_with_ocr_smart(pdf_bytes)
                 all_ocr_sections.extend(sections)
 
             csv_df, location_name, date_filename_str, date_display_str = process_toast_csv(csv_files)
