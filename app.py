@@ -162,7 +162,7 @@ def extract_time_from_datetime(datetime_val) -> str:
 
 
 def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Audit engine matching OCR sections against CSV edit entries with section-level binding."""
+    """Audit engine matching OCR sections against CSV edit entries with physical page deduplication."""
     
     emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
     mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower() or "by" in c.lower()), df.columns[1])
@@ -194,17 +194,16 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
     filtered["Shift_Key"] = filtered[emp_col].astype(str) + "_" + pd.to_datetime(filtered[in_date_col], format="mixed", errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     
     matched_shift_keys = set()
-    used_section_keys = set()
+    used_page_indices = set()
 
-    # SECTION-FIRST MATCHING BOUND TO (PAGE_INDEX, SECTION_TYPE)
+    # SECTION-FIRST MATCHING BOUND TO PHYSICAL PAGE INDEX
     for page_idx, sec_type, sec_text in ocr_sections:
-        sec_key = (page_idx, sec_type)
-        if sec_key in used_section_keys:
+        if page_idx in used_page_indices:
             continue
 
         best_match_key = None
 
-        # Pass 1: Strict Name AND Date Match
+        # Pass 1: Strict Name AND Shift Date Match
         for _, row in filtered.iterrows():
             shift_key = row["Shift_Key"]
             if shift_key in matched_shift_keys:
@@ -221,7 +220,7 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
                 best_match_key = shift_key
                 break
 
-        # Pass 2: Name-Only Fallback
+        # Pass 2: Fallback Name Match (Only if Pass 1 didn't trigger)
         if best_match_key is None:
             for _, row in filtered.iterrows():
                 shift_key = row["Shift_Key"]
@@ -238,7 +237,7 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
 
         if best_match_key is not None:
             matched_shift_keys.add(best_match_key)
-            used_section_keys.add(sec_key)
+            used_page_indices.add(page_idx)
 
     # Apply match flags back to CSV rows
     filtered["Has_Signed_Form"] = filtered["Shift_Key"].isin(matched_shift_keys)
