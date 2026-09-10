@@ -36,11 +36,11 @@ def is_not_cover_or_report(ocr_text: str) -> bool:
     return True
 
 
-def extract_text_with_ocr_smart(pdf_bytes: bytes) -> tuple[list[tuple[int, str, str]], int]:
+def extract_text_with_ocr_smart(pdf_bytes: bytes, shift_master: pd.DataFrame, emp_col: str) -> tuple[list[tuple[int, str, str]], int]:
     """
-    Extracts text sections from PDF pages.
-    For dual-form sheets (separated by 'SOLICITUD DE HORAS EDITADAS'), splits into Top/Bottom.
-    Otherwise, extracts full intact page text.
+    Extracts text sections intelligently page-by-page.
+    Splits into Top/Bottom halves ONLY if a physical page contains two distinct employee form names.
+    Otherwise, processes as a single intact form page.
     """
     if not pdf_bytes:
         return [], 0
@@ -54,11 +54,15 @@ def extract_text_with_ocr_smart(pdf_bytes: bytes) -> tuple[list[tuple[int, str, 
     page_sections = []
     total_pages = len(images)
 
+    # Master list of employee name tokens for dual-form detection
+    all_emp_names = shift_master[emp_col].dropna().unique().tolist() if not shift_master.empty else []
+
     for page_idx, img in enumerate(images):
         txt_full = pytesseract.image_to_string(img)
         if txt_full and len(txt_full.strip()) > 30 and is_not_cover_or_report(txt_full):
+            
             if "SOLICITUD DE HORAS EDITADAS" in txt_full.upper():
-                # Dual-form page split
+                # Split page to check for two distinct employee names
                 width, height = img.size
                 top_half = img.crop((0, 0, width, int(height * 0.55)))
                 bottom_half = img.crop((0, int(height * 0.45), width, height))
@@ -66,12 +70,20 @@ def extract_text_with_ocr_smart(pdf_bytes: bytes) -> tuple[list[tuple[int, str, 
                 txt_top = pytesseract.image_to_string(top_half)
                 txt_bottom = pytesseract.image_to_string(bottom_half)
 
-                if txt_top and len(txt_top.strip()) > 20:
-                    page_sections.append((page_idx, "top", txt_top))
-                if txt_bottom and len(txt_bottom.strip()) > 20:
-                    page_sections.append((page_idx, "bottom", txt_bottom))
+                top_matched = [emp for emp in all_emp_names if any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", txt_top, re.IGNORECASE) for t in get_name_tokens(emp))]
+                bot_matched = [emp for emp in all_emp_names if any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", txt_bottom, re.IGNORECASE) for t in get_name_tokens(emp))]
+
+                # If bottom half has a distinct employee from top half -> Dual Form Page!
+                distinct_bot = [emp for emp in bot_matched if emp not in top_matched]
+
+                if distinct_bot:
+                    if txt_top and len(txt_top.strip()) > 20:
+                        page_sections.append((page_idx, "top", txt_top))
+                    if txt_bottom and len(txt_bottom.strip()) > 20:
+                        page_sections.append((page_idx, "bottom", txt_bottom))
+                else:
+                    page_sections.append((page_idx, "full", txt_full))
             else:
-                # Single-form page
                 page_sections.append((page_idx, "full", txt_full))
 
     return page_sections, total_pages
@@ -198,13 +210,11 @@ def extract_time_from_datetime(datetime_val) -> str:
         return match.group(0) if match else val_str
 
 
-def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Universal audit engine matching PDF form sections against CSV shift edits."""
+def prepare_shift_master(df: pd.DataFrame) -> tuple[pd.DataFrame, str, str, str, str, str, str]:
+    """Auto-detects CSV columns, filters system rows, and builds Master Unique Shift Edit DataFrame."""
     if df.empty:
-        summary_df = pd.DataFrame(columns=["Manager", "Total_Edits", "Forms_Present", "Forms_Missing", "Compliance_Pct"])
-        return summary_df, pd.DataFrame()
+        return pd.DataFrame(), "", "", "", "", "", ""
 
-    # Dynamic Column Auto-Detection
     emp_col = next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower() and "guid" not in c.lower() and "external" not in c.lower()), None)
     if not emp_col:
         emp_col = next((c for c in df.columns if "employee" in c.lower()), df.columns[0])
@@ -219,35 +229,48 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
     job_title_col = next((c for c in df.columns if "job" in c.lower() and "id" not in c.lower() and "guid" not in c.lower() and "code" not in c.lower()), None)
     time_edit_col = next((c for c in df.columns if "time" in c.lower() and "total" not in c.lower() and "break" not in c.lower() and "in" not in c.lower() and "out" not in c.lower()), None)
 
-    # 1. Filter out missing managers
+    # Filter out missing managers
     filtered = df.dropna(subset=[mgr_col]).copy()
 
-    # 2. Filter out CREATE actions
+    # Filter out CREATE actions
     if change_col and change_col in filtered.columns:
         filtered = filtered[filtered[change_col].astype(str).str.upper() != "CREATE"]
 
-    # 3. Filter ghost employees
-    has_digit_pattern = r"\d"
+    # Filter ghost/system employees
+    has_digit = r"\d"
     system_terms = ["system", "ghost", "house", "auto", "toast", "drawer"]
     system_pattern = "|".join(system_terms)
-    
+
     filtered = filtered[
-        ~filtered[emp_col].astype(str).str.contains(has_digit_pattern, regex=True, na=False) &
+        ~filtered[emp_col].astype(str).str.contains(has_digit, regex=True, na=False) &
         ~filtered[emp_col].astype(str).str.lower().str.contains(system_pattern, na=False) &
         ~filtered[mgr_col].astype(str).str.lower().str.contains(system_pattern, na=False)
     ].copy()
 
     filtered["Shift_Date_Clean"] = pd.to_datetime(filtered[in_date_col], format="mixed", errors="coerce").dt.strftime("%m/%d/%Y").fillna("")
 
-    # Deduplicate CSV to Unique Manager Shift Edits
-    shift_master = filtered.drop_duplicates(subset=[emp_col, "Shift_Date_Clean", mgr_col]).copy().reset_index()
+    # CONSOLIDATE RAW LOG ROWS TO UNIQUE SHIFT EDITS
+    shift_master = filtered.drop_duplicates(subset=[emp_col, "Shift_Date_Clean", mgr_col]).copy().reset_index(drop=True)
     shift_master["Has_Signed_Form"] = False
+
+    return shift_master, emp_col, mgr_col, in_date_col, out_date_col, job_title_col, time_edit_col
+
+
+def analyze_edits(shift_master: pd.DataFrame, ocr_sections: list[tuple[int, str, str]], emp_col: str, mgr_col: str, in_date_col: str, out_date_col: str, job_title_col: str, time_edit_col: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Universal audit engine matching PDF form sections against Unique Master Shift Edits."""
+    if shift_master.empty:
+        summary_df = pd.DataFrame(columns=["Manager", "Total_Edits", "Forms_Present", "Forms_Missing", "Compliance_Pct"])
+        return summary_df, pd.DataFrame()
 
     used_shift_indices = set()
     used_sections = set()
+    used_pages = set()
 
     # MATCH EACH PDF FORM SECTION TO A UNIQUE SHIFT EDIT
     for page_idx, sec_type, sec_text in ocr_sections:
+        if sec_type == "full" and page_idx in used_pages:
+            continue
+
         sec_key = (page_idx, sec_type)
         if sec_key in used_sections:
             continue
@@ -288,38 +311,32 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
             shift_master.loc[best_match_idx, "Has_Signed_Form"] = True
             used_shift_indices.add(best_match_idx)
             used_sections.add(sec_key)
+            if sec_type == "full":
+                used_pages.add(page_idx)
 
-    # Map Has_Signed_Form back to all filtered rows
-    signed_shifts_set = set(
-        shift_master[shift_master["Has_Signed_Form"]][
-            [emp_col, "Shift_Date_Clean", mgr_col]
-        ].itertuples(index=False, name=None)
-    )
+    # BUILD EXECUTIVE SUMMARY DIRECTLY FROM SHIFT MASTER
+    summary_df = shift_master.groupby(mgr_col).agg(
+        Total_Edits=("Has_Signed_Form", "count"),
+        Forms_Present=("Has_Signed_Form", "sum")
+    ).reset_index()
 
-    filtered["Has_Signed_Form"] = filtered[
-        [emp_col, "Shift_Date_Clean", mgr_col]
-    ].apply(lambda r: tuple(r) in signed_shifts_set, axis=1)
+    summary_df.rename(columns={mgr_col: "Manager"}, inplace=True)
+    summary_df["Forms_Missing"] = summary_df["Total_Edits"] - summary_df["Forms_Present"]
+    summary_df["Compliance_Pct"] = ((summary_df["Forms_Present"] / summary_df["Total_Edits"]) * 100).round(1)
 
-    # Build detailed records
+    # BUILD DETAIL REPORT DIRECTLY FROM SHIFT MASTER
     details_list = []
-    for _, row in filtered.iterrows():
-        job_title = str(row[job_title_col]) if job_title_col and not pd.isna(row[job_title_col]) else ""
+    for _, row in shift_master.iterrows():
+        job_title = str(row[job_title_col]) if job_title_col and job_title_col in row and not pd.isna(row[job_title_col]) else ""
         is_break = "Yes" if "break" in job_title.lower() else "No"
 
-        in_time = extract_time_from_datetime(row[in_date_col]) if in_date_col else "N/A"
-        out_time = extract_time_from_datetime(row[out_date_col]) if out_date_col else "N/A"
-
-        shift_date = "N/A"
-        if in_date_col and not pd.isna(row[in_date_col]):
-            try:
-                shift_date = pd.to_datetime(row[in_date_col]).strftime("%m/%d/%Y")
-            except Exception:
-                shift_date = str(row[in_date_col]).split()[0]
+        in_time = extract_time_from_datetime(row[in_date_col]) if in_date_col in row else "N/A"
+        out_time = extract_time_from_datetime(row[out_date_col]) if out_date_col and out_date_col in row and not pd.isna(row[out_date_col]) else "N/A"
 
         details_list.append({
             "Manager": str(row[mgr_col]).strip(),
             "Employee": str(row[emp_col]).strip(),
-            "Shift_Date": shift_date,
+            "Shift_Date": str(row["Shift_Date_Clean"]),
             "In_Time": in_time,
             "Out_Time": out_time,
             "Is_Break_Edit": is_break,
@@ -327,21 +344,6 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
         })
 
     details_df = pd.DataFrame(details_list)
-
-    if details_df.empty:
-        summary_df = pd.DataFrame(columns=["Manager", "Total_Edits", "Forms_Present", "Forms_Missing", "Compliance_Pct"])
-        return summary_df, details_df
-
-    # Manager Summary based on Unique Shift Edits
-    unique_shifts_df = details_df.drop_duplicates(subset=["Employee", "Shift_Date", "Manager"])
-
-    summary_df = unique_shifts_df.groupby("Manager").agg(
-        Total_Edits=("Has_Signed_Form", "count"),
-        Forms_Present=("Has_Signed_Form", "sum")
-    ).reset_index()
-
-    summary_df["Forms_Missing"] = summary_df["Total_Edits"] - summary_df["Forms_Present"]
-    summary_df["Compliance_Pct"] = ((summary_df["Forms_Present"] / summary_df["Total_Edits"]) * 100).round(1)
 
     return summary_df, details_df
 
@@ -430,20 +432,24 @@ if st.button("Process & Generate Audit", type="primary"):
     else:
         with st.spinner("Running page-by-page OCR and matching edits..."):
             try:
-                # 1. OCR Processing
+                # 1. Process CSV & Build Master Unique Shift Edits
+                csv_df, location_name, date_filename_str, date_display_str = process_toast_csv(csv_files)
+                shift_master, emp_col, mgr_col, in_date_col, out_date_col, job_title_col, time_edit_col = prepare_shift_master(csv_df)
+
+                # 2. OCR Processing Page-by-Page
                 all_ocr_sections = []
                 total_pdf_pages = 0
                 for pdf_file in pdf_files:
                     pdf_bytes = pdf_file.getvalue()
-                    sections, page_count = extract_text_with_ocr_smart(pdf_bytes)
+                    sections, page_count = extract_text_with_ocr_smart(pdf_bytes, shift_master, emp_col)
                     all_ocr_sections.extend(sections)
                     total_pdf_pages += page_count
 
-                # 2. CSV Processing & Location Auto-Detection
-                csv_df, location_name, date_filename_str, date_display_str = process_toast_csv(csv_files)
-
-                # 3. Perform Matching & Audit Analysis
-                summary_df, details_df = analyze_edits(csv_df, all_ocr_sections)
+                # 3. Perform Matching & Generate Synchronized Reports
+                summary_df, details_df = analyze_edits(
+                    shift_master, all_ocr_sections, 
+                    emp_col, mgr_col, in_date_col, out_date_col, job_title_col, time_edit_col
+                )
 
                 st.success("Audit complete!")
 
@@ -465,7 +471,7 @@ if st.button("Process & Generate Audit", type="primary"):
                     st.write(f"**Date Range Extracted:** {date_display_str}")
                     st.write(f"**PDF Pages Uploaded:** {total_pdf_pages}")
                     st.write(f"**Valid Form Sections Recognized:** {len(all_ocr_sections)}")
-                    st.write(f"**Total CSV Records Loaded:** {len(csv_df)}")
+                    st.write(f"**Unique Shift Edits Prepared:** {len(shift_master)}")
 
                 if total_forms == 0 and total_edits > 0:
                     st.warning("⚠️ 0 signed forms were matched. Please verify that the PDF contains valid form sheets and that scans are oriented right-side up.")
