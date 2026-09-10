@@ -8,10 +8,10 @@ from pdf2image import convert_from_bytes
 import pytesseract
 
 
-def is_valid_edited_punch_form(ocr_text: str) -> bool:
+def is_truly_signed_acknowledgement_form(ocr_text: str) -> bool:
     """
-    Validates if an OCR text section is a genuine Edited Punch Request form.
-    Rejects paycheck rosters, cover pages, and printed Toast POS report tables.
+    Strictly verifies if an OCR section is a genuine filled Edited Punch Request form sheet.
+    Rejects rosters, cover sheets, and printed Toast POS audit reports.
     """
     txt_upper = ocr_text.upper()
     
@@ -29,22 +29,26 @@ def is_valid_edited_punch_form(ocr_text: str) -> bool:
     ]
     if sum(1 for term in report_reject_terms if term in txt_upper) >= 2:
         return False
-        
-    # Positive validation: Must contain clear Edited Punch Request form indicators
-    form_accept_terms = [
-        "EDITED PUNCH REQUEST", "SOLICITUD DE HORAS", "HORAS EDITADAS",
-        "CORRECT HOURS WORKED", "PONCHAR ADENTRO", "FORGOT TO PUNCH",
-        "FORGOT TO CLOCK", "OLVIDE PONCHAR", "AJUSTADO MI TIEMPO",
-        "POS SYSTEM TO REFLECT", "PUNCH REQUEST", "PONCHAR AFUERA"
-    ]
+
+    # Header check
+    has_header = any(
+        kw in txt_upper 
+        for kw in ["EDITED PUNCH REQUEST", "SOLICITUD DE HORAS", "HORAS EDITADAS", "PUNCH REQUEST"]
+    )
     
-    return any(term in txt_upper for term in form_accept_terms)
+    # Manager / Signature completion field check
+    has_signature_field = any(
+        kw in txt_upper 
+        for kw in ["COMPLETED BY MANAGER", "MANAGER SIGNATURE", "FIRMA", "SIGNATURE", "COMPLETED BY"]
+    )
+
+    return has_header and has_signature_field
 
 
 def extract_text_with_ocr_split(pdf_bytes: bytes) -> list[tuple[int, str, str]]:
     """
     Converts PDF pages to images and splits each page into TOP and BOTTOM halves.
-    Returns tuples of (page_index, section_id, section_text).
+    Returns tuples of (page_index, section_type, section_text).
     """
     if not pdf_bytes:
         return []
@@ -62,11 +66,11 @@ def extract_text_with_ocr_split(pdf_bytes: bytes) -> list[tuple[int, str, str]]:
         txt_top = pytesseract.image_to_string(top_half)
         txt_bottom = pytesseract.image_to_string(bottom_half)
 
-        # Process sections that pass form validation
-        if txt_top and len(txt_top.strip()) > 20 and is_valid_edited_punch_form(txt_top):
+        # Include sections passing strict validation
+        if txt_top and len(txt_top.strip()) > 20 and is_truly_signed_acknowledgement_form(txt_top):
             page_sections.append((page_idx, "top", txt_top))
             
-        if txt_bottom and len(txt_bottom.strip()) > 20 and is_valid_edited_punch_form(txt_bottom):
+        if txt_bottom and len(txt_bottom.strip()) > 20 and is_truly_signed_acknowledgement_form(txt_bottom):
             page_sections.append((page_idx, "bottom", txt_bottom))
 
     return page_sections
@@ -158,7 +162,7 @@ def extract_time_from_datetime(datetime_val) -> str:
 
 
 def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Audit engine matching OCR sections against CSV edit entries with physical page deduplication."""
+    """Audit engine matching OCR sections against CSV edit entries with section-level binding."""
     
     emp_col = "Employee" if "Employee" in df.columns else next((c for c in df.columns if "employee" in c.lower() and "id" not in c.lower()), df.columns[0])
     mgr_col = "Manager" if "Manager" in df.columns else next((c for c in df.columns if "manager" in c.lower() or "edited" in c.lower() or "by" in c.lower()), df.columns[1])
@@ -190,11 +194,12 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
     filtered["Shift_Key"] = filtered[emp_col].astype(str) + "_" + pd.to_datetime(filtered[in_date_col], format="mixed", errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     
     matched_shift_keys = set()
-    used_page_indices = set()
+    used_section_keys = set()
 
-    # SECTION-FIRST MATCHING WITH PHYSICAL PAGE DEDUPLICATION
+    # SECTION-FIRST MATCHING BOUND TO (PAGE_INDEX, SECTION_TYPE)
     for page_idx, sec_type, sec_text in ocr_sections:
-        if page_idx in used_page_indices:
+        sec_key = (page_idx, sec_type)
+        if sec_key in used_section_keys:
             continue
 
         best_match_key = None
@@ -233,7 +238,7 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
 
         if best_match_key is not None:
             matched_shift_keys.add(best_match_key)
-            used_page_indices.add(page_idx)
+            used_section_keys.add(sec_key)
 
     # Apply match flags back to CSV rows
     filtered["Has_Signed_Form"] = filtered["Shift_Key"].isin(matched_shift_keys)
