@@ -38,8 +38,8 @@ def is_not_cover_or_report(ocr_text: str) -> bool:
 
 def extract_text_with_ocr_smart(pdf_bytes: bytes) -> tuple[list[tuple[int, str, str]], int]:
     """
-    Runs OCR on full intact pages and overlapping top/bottom halves (16% overlap).
-    Guarantees form text near page midpoints is never cut in half.
+    Converts PDF pages to images. Splits pages into Top (0-52%) and Bottom (48-100%) halves
+    to capture dual-form sheets (Laguna Beach layout) and single-form sheets (Danville layout).
     """
     if not pdf_bytes:
         return [], 0
@@ -56,18 +56,14 @@ def extract_text_with_ocr_smart(pdf_bytes: bytes) -> tuple[list[tuple[int, str, 
     for page_idx, img in enumerate(images):
         width, height = img.size
         
-        # 1. Full page intact text
-        txt_full = pytesseract.image_to_string(img)
-        if txt_full and len(txt_full.strip()) > 30 and is_not_cover_or_report(txt_full):
-            page_sections.append((page_idx, "full", txt_full))
-        
-        # 2. Overlapping Top and Bottom halves (Top: 0-58%, Bottom: 42-100%)
-        top_half = img.crop((0, 0, width, int(height * 0.58)))
-        bottom_half = img.crop((0, int(height * 0.42), width, height))
+        # Crop Top and Bottom halves of page
+        top_half = img.crop((0, 0, width, int(height * 0.52)))
+        bottom_half = img.crop((0, int(height * 0.48), width, height))
 
         txt_top = pytesseract.image_to_string(top_half)
         txt_bottom = pytesseract.image_to_string(bottom_half)
 
+        # Include sections passing location-agnostic validation
         if txt_top and len(txt_top.strip()) > 20 and is_not_cover_or_report(txt_top):
             page_sections.append((page_idx, "top", txt_top))
             
@@ -239,12 +235,14 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
 
     filtered["Shift_Date_Clean"] = pd.to_datetime(filtered[in_date_col], format="mixed", errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
     
-    filtered["Has_Signed_Form"] = False
+    # Consolidate CSV into unique Manager Shift Edits
+    shift_edits_df = filtered.drop_duplicates(subset=[emp_col, "Shift_Date_Clean", mgr_col]).copy()
+    shift_edits_df["Has_Signed_Form"] = False
+
     used_csv_indices = set()
     used_sections = set()
-    page_matched_employees = {}
 
-    # MATCH EACH VALID PDF FORM SECTION TO A CSV SHIFT EDIT
+    # MATCH EACH VALID PDF FORM SECTION TO A UNIQUE SHIFT EDIT
     for page_idx, sec_type, sec_text in ocr_sections:
         sec_key = (page_idx, sec_type)
         if sec_key in used_sections:
@@ -253,14 +251,11 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
         best_match_idx = None
 
         # Pass 1: Strict Employee Name AND Shift Date Match
-        for idx, row in filtered.iterrows():
+        for idx, row in shift_edits_df.iterrows():
             if idx in used_csv_indices:
                 continue
 
             employee = str(row[emp_col]).strip()
-            if page_idx in page_matched_employees and employee in page_matched_employees[page_idx] and sec_type == "full":
-                continue
-
             tokens = get_name_tokens(employee)
             date_vars = get_date_variants_universal(row[in_date_col]) + (get_date_variants_universal(row[time_edit_col]) if time_edit_col and time_edit_col in row else [])
 
@@ -273,14 +268,11 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
 
         # Pass 2: Fallback Employee Name Match
         if best_match_idx is None:
-            for idx, row in filtered.iterrows():
+            for idx, row in shift_edits_df.iterrows():
                 if idx in used_csv_indices:
                     continue
 
                 employee = str(row[emp_col]).strip()
-                if page_idx in page_matched_employees and employee in page_matched_employees[page_idx] and sec_type == "full":
-                    continue
-
                 tokens = get_name_tokens(employee)
                 has_emp = any(re.search(r"\b" + re.escape(t[:3]) + r"[a-z]*\b", sec_text, re.IGNORECASE) for t in tokens) or fuzzy_match_tokens(tokens, sec_text)
 
@@ -289,18 +281,13 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
                     break
 
         if best_match_idx is not None:
-            filtered.loc[best_match_idx, "Has_Signed_Form"] = True
+            shift_edits_df.loc[best_match_idx, "Has_Signed_Form"] = True
             used_csv_indices.add(best_match_idx)
             used_sections.add(sec_key)
-            
-            emp_matched = str(filtered.loc[best_match_idx, emp_col]).strip()
-            if page_idx not in page_matched_employees:
-                page_matched_employees[page_idx] = set()
-            page_matched_employees[page_idx].add(emp_matched)
 
     # Build detailed records
     details_list = []
-    for _, row in filtered.iterrows():
+    for _, row in shift_edits_df.iterrows():
         job_title = str(row[job_title_col]) if job_title_col and not pd.isna(row[job_title_col]) else ""
         is_break = "Yes" if "break" in job_title.lower() else "No"
 
@@ -330,11 +317,8 @@ def analyze_edits(df: pd.DataFrame, ocr_sections: list[tuple[int, str, str]]) ->
         summary_df = pd.DataFrame(columns=["Manager", "Total_Edits", "Forms_Present", "Forms_Missing", "Compliance_Pct"])
         return summary_df, details_df
 
-    # Deduplicate multiple Toast audit log rows belonging to the same shift
-    unique_shifts_df = details_df.drop_duplicates(subset=["Employee", "Shift_Date", "Manager"])
-
     # Summarize shift edits per manager
-    summary_df = unique_shifts_df.groupby("Manager").agg(
+    summary_df = details_df.groupby("Manager").agg(
         Total_Edits=("Has_Signed_Form", "count"),
         Forms_Present=("Has_Signed_Form", "sum")
     ).reset_index()
